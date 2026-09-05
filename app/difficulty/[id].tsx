@@ -1,7 +1,8 @@
 import { Ionicons } from "@expo/vector-icons";
 import { router, useLocalSearchParams } from "expo-router";
-import React, { useEffect, useState } from 'react';
-import { SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, View, Modal, Image, ActivityIndicator } from "react-native";
+import React, { useEffect, useState, useRef } from 'react';
+import { SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, View, Modal, Image, ActivityIndicator, Animated, Platform } from "react-native";
+import * as Haptics from 'expo-haptics';
 import { useAuth } from "../../context/AuthContext";
 import { API_URL } from "../../context/config";
 
@@ -20,8 +21,49 @@ interface DBLesson {
   quiz_id?: number;
 }
 
+const THEME_COLORS: Record<string, { primary: string; light: string; border: string }> = {
+  'story-grammar': { primary: '#7C3AED', light: '#EDE9FE', border: '#DDD6FE' },
+  'mathematics': { primary: '#2563EB', light: '#DBEAFE', border: '#BFDBFE' },
+  'technology-and-livelihood-education': { primary: '#D97706', light: '#FEF3C7', border: '#FDE68A' },
+  'araling-panlipunan': { primary: '#059669', light: '#D1FAE5', border: '#A7F3D0' },
+};
+
+const getStoryGrammarBadge = (index: number) => {
+  switch (index) {
+    case 0:
+      return {
+        label: "Character & Setting",
+        icon: "person-outline" as const,
+        color: "#7C3AED",
+        bgColor: "#EDE9FE",
+      };
+    case 1:
+      return {
+        label: "Problem & Challenge",
+        icon: "alert-circle-outline" as const,
+        color: "#D97706",
+        bgColor: "#FEF3C7",
+      };
+    case 2:
+      return {
+        label: "Action & Rules",
+        icon: "build-outline" as const,
+        color: "#2563EB",
+        bgColor: "#DBEAFE",
+      };
+    default:
+      return {
+        label: "Resolution & Outcome",
+        icon: "checkmark-circle-outline" as const,
+        color: "#059669",
+        bgColor: "#D1FAE5",
+      };
+  }
+};
+
 export default function DifficultyScreen() {
   const { id: lessonGroupId, subjectId, topicId, deafEnglish: deafEngParam } = useLocalSearchParams();
+  const theme = THEME_COLORS[topicId as string] || THEME_COLORS[subjectId as string] || THEME_COLORS['story-grammar'];
   const { user } = useAuth();
   const userId = user?.id || 1;
 
@@ -116,11 +158,55 @@ export default function DifficultyScreen() {
     }
   }, [lessonGroupId, topicId, userId]);
 
+  // Slide animation values for smooth horizontal transitions
+  const slideAnim = useRef(new Animated.Value(0)).current;
+  const slideOpacity = useRef(new Animated.Value(1)).current;
+
   const handleOpenDifficulty = (diff: 'easy' | 'medium' | 'hard') => {
     const lesson = lessonsMap[diff];
     if (!lesson) return;
     setActiveLesson(lesson);
     setActiveDescIndex(0);
+    slideAnim.setValue(0);
+    slideOpacity.setValue(1);
+  };
+
+  const handleNextSlide = () => {
+    if (!activeLesson || activeDescIndex >= activeLesson.slides.length - 1) return;
+    try {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+    } catch {}
+
+    Animated.parallel([
+      Animated.timing(slideAnim, { toValue: -35, duration: 100, useNativeDriver: Platform.OS !== 'web' }),
+      Animated.timing(slideOpacity, { toValue: 0, duration: 100, useNativeDriver: Platform.OS !== 'web' }),
+    ]).start(() => {
+      setActiveDescIndex(prev => prev + 1);
+      slideAnim.setValue(35);
+      Animated.parallel([
+        Animated.timing(slideAnim, { toValue: 0, duration: 160, useNativeDriver: Platform.OS !== 'web' }),
+        Animated.timing(slideOpacity, { toValue: 1, duration: 160, useNativeDriver: Platform.OS !== 'web' }),
+      ]).start();
+    });
+  };
+
+  const handlePrevSlide = () => {
+    if (!activeLesson || activeDescIndex <= 0) return;
+    try {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+    } catch {}
+
+    Animated.parallel([
+      Animated.timing(slideAnim, { toValue: 35, duration: 100, useNativeDriver: Platform.OS !== 'web' }),
+      Animated.timing(slideOpacity, { toValue: 0, duration: 100, useNativeDriver: Platform.OS !== 'web' }),
+    ]).start(() => {
+      setActiveDescIndex(prev => prev - 1);
+      slideAnim.setValue(-35);
+      Animated.parallel([
+        Animated.timing(slideAnim, { toValue: 0, duration: 160, useNativeDriver: Platform.OS !== 'web' }),
+        Animated.timing(slideOpacity, { toValue: 1, duration: 160, useNativeDriver: Platform.OS !== 'web' }),
+      ]).start();
+    });
   };
 
   const currentSlide = activeLesson?.slides?.[activeDescIndex];
@@ -134,7 +220,7 @@ export default function DifficultyScreen() {
     return (
       <SafeAreaView style={styles.safeArea}>
         <View style={styles.centerContainer}>
-          <ActivityIndicator size="large" color="#0284C7" />
+          <ActivityIndicator size="large" color={theme.primary} />
           <Text style={{ marginTop: 10, color: '#6B7280' }}>Loading difficulty levels...</Text>
         </View>
       </SafeAreaView>
@@ -159,8 +245,8 @@ export default function DifficultyScreen() {
     <SafeAreaView style={styles.safeArea}>
       {/* Header */}
       <View style={styles.header}>
-        <TouchableOpacity style={styles.backButton} onPress={() => router.back()}>
-          <Ionicons name="arrow-back" size={24} color="#0284C7" />
+        <TouchableOpacity style={[styles.backButton, { backgroundColor: theme.light }]} onPress={() => router.back()}>
+          <Ionicons name="arrow-back" size={24} color={theme.primary} />
         </TouchableOpacity>
         <Text style={styles.headerTitle} numberOfLines={1}>{groupTitle || "Select Difficulty"}</Text>
       </View>
@@ -196,12 +282,15 @@ export default function DifficultyScreen() {
                 </View>
 
                 <View style={{ flex: 1 }}>
-                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
                     <Text style={styles.cardTitle}>
-                      {diff === 'easy' ? '🟢 Easy Version' : diff === 'medium' ? '🟡 Medium Version' : '🔴 Hard Version'}
+                      {diff === 'easy' ? 'Easy Tier' : diff === 'medium' ? 'Medium Tier' : 'Hard Tier'}
                     </Text>
                     {diff === 'easy' && !progress.easy_passed && (
-                      <Text style={styles.recommendedBadge}>⭐ Recommended</Text>
+                      <View style={styles.recommendedBadge}>
+                        <Ionicons name="star" size={11} color="#854D0E" />
+                        <Text style={styles.recommendedBadgeText}>Recommended</Text>
+                      </View>
                     )}
                   </View>
 
@@ -233,8 +322,8 @@ export default function DifficultyScreen() {
         >
           <SafeAreaView style={styles.modalContainer}>
             <View style={styles.header}>
-              <TouchableOpacity style={styles.backButton} onPress={() => setActiveLesson(null)}>
-                <Ionicons name="close" size={24} color="#0284C7" />
+              <TouchableOpacity style={[styles.backButton, { backgroundColor: theme.light }]} onPress={() => setActiveLesson(null)}>
+                <Ionicons name="close" size={24} color={theme.primary} />
               </TouchableOpacity>
               <Text style={styles.headerTitle} numberOfLines={1}>
                 {groupTitle} ({activeLesson.difficulty.toUpperCase()})
@@ -247,46 +336,57 @@ export default function DifficultyScreen() {
                 {activeLesson.slides.map((_, i) => (
                   <View
                     key={i}
-                    style={[styles.progressDot, i === activeDescIndex ? styles.progressDotActive : null]}
+                    style={[styles.progressDot, i === activeDescIndex ? [styles.progressDotActive, { backgroundColor: theme.primary }] : null]}
                   />
                 ))}
               </View>
 
               {/* Slide Card */}
-              <View style={styles.flipCard}>
+              <Animated.View style={[styles.flipCard, { transform: [{ translateX: slideAnim }], opacity: slideOpacity }]}>
+                {/* Story Grammar Indicator Chip */}
+                {(() => {
+                  const badge = getStoryGrammarBadge(activeDescIndex);
+                  return (
+                    <View style={[styles.narrativeBadge, { backgroundColor: badge.bgColor }]}>
+                      <Ionicons name={badge.icon} size={14} color={badge.color} />
+                      <Text style={[styles.narrativeBadgeText, { color: badge.color }]}>{badge.label}</Text>
+                    </View>
+                  );
+                })()}
+
                 <ScrollView contentContainerStyle={styles.cardScrollView} showsVerticalScrollIndicator={false}>
                   {currentSlide?.image_url ? (
                     <View style={styles.imageWrapper}>
                       <Image source={{ uri: currentSlide.image_url }} style={styles.slideImage} resizeMode="contain" />
                     </View>
                   ) : (
-                    <Ionicons name="sparkles-outline" size={32} color="#0284C7" style={styles.cardDecorationIcon} />
+                    <Ionicons name="sparkles-outline" size={32} color={theme.primary} style={styles.cardDecorationIcon} />
                   )}
                   <Text style={styles.cardText}>{slideText}</Text>
                 </ScrollView>
                 <Text style={styles.cardCounter}>
                   {activeDescIndex + 1} of {activeLesson.slides.length}
                 </Text>
-              </View>
+              </Animated.View>
 
               {/* Nav Footer */}
               <View style={styles.actionsFooter}>
                 <TouchableOpacity
-                  style={[styles.navBtn, activeDescIndex === 0 && styles.navBtnDisabled]}
+                  style={[styles.navBtn, { backgroundColor: theme.light }, activeDescIndex === 0 && styles.navBtnDisabled]}
                   disabled={activeDescIndex === 0}
-                  onPress={() => setActiveDescIndex(prev => prev - 1)}
+                  onPress={handlePrevSlide}
                 >
-                  <Ionicons name="arrow-back" size={20} color={activeDescIndex === 0 ? "#9CA3AF" : "#0284C7"} />
-                  <Text style={[styles.navBtnText, activeDescIndex === 0 && styles.navBtnTextDisabled]}>Previous</Text>
+                  <Ionicons name="arrow-back" size={20} color={activeDescIndex === 0 ? "#9CA3AF" : theme.primary} />
+                  <Text style={[styles.navBtnText, { color: theme.primary }, activeDescIndex === 0 && styles.navBtnTextDisabled]}>Previous</Text>
                 </TouchableOpacity>
 
                 {activeDescIndex < activeLesson.slides.length - 1 ? (
                   <TouchableOpacity
-                    style={styles.navBtn}
-                    onPress={() => setActiveDescIndex(prev => prev + 1)}
+                    style={[styles.navBtn, { backgroundColor: theme.light }]}
+                    onPress={handleNextSlide}
                   >
-                    <Text style={styles.navBtnText}>Next</Text>
-                    <Ionicons name="arrow-forward" size={20} color="#0284C7" />
+                    <Text style={[styles.navBtnText, { color: theme.primary }]}>Next</Text>
+                    <Ionicons name="arrow-forward" size={20} color={theme.primary} />
                   </TouchableOpacity>
                 ) : (
                   <TouchableOpacity
@@ -297,8 +397,8 @@ export default function DifficultyScreen() {
                       router.push(`/quiz/${topicId}?subjectId=${subjectId}&deafEnglish=${isDeafEnglish}&lessonId=${activeLesson.id}&quizId=${qId || ''}&difficulty=${activeLesson.difficulty}` as any);
                     }}
                   >
+                    <Ionicons name="pencil" size={18} color="white" style={{ marginRight: 6 }} />
                     <Text style={styles.quizStartBtnText}>Start {activeLesson.difficulty.toUpperCase()} Quiz</Text>
-                    <Ionicons name="pencil" size={20} color="white" style={{ marginLeft: 6 }} />
                   </TouchableOpacity>
                 )}
               </View>
@@ -377,7 +477,7 @@ const styles = StyleSheet.create({
   safeArea: { flex: 1, backgroundColor: "#F8F9FA" },
   centerContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: 20 },
   header: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 20, paddingTop: 40, paddingBottom: 20, backgroundColor: '#F8F9FA' },
-  backButton: { width: 40, height: 40, borderRadius: 20, backgroundColor: '#E0F2FE', justifyContent: 'center', alignItems: 'center', marginRight: 16 },
+  backButton: { width: 48, height: 48, borderRadius: 24, backgroundColor: '#E0F2FE', justifyContent: 'center', alignItems: 'center', marginRight: 16 },
   headerTitle: { flex: 1, fontSize: 20, fontWeight: 'bold', color: '#1F2937' },
   deafButton: { paddingHorizontal: 12, paddingVertical: 8, borderRadius: 20, backgroundColor: '#E0F2FE', borderWidth: 1, borderColor: '#0284C7' },
   deafButtonActive: { backgroundColor: '#0284C7' },
@@ -395,7 +495,10 @@ const styles = StyleSheet.create({
   cardIconBox: { width: 48, height: 48, borderRadius: 12, backgroundColor: 'white', justifyContent: 'center', alignItems: 'center' },
   cardTitle: { fontSize: 16, fontWeight: 'bold', color: '#1F2937' },
   cardSub: { fontSize: 13, color: '#6B7280', marginTop: 2 },
-  recommendedBadge: { fontSize: 11, backgroundColor: '#FEF08A', color: '#854D0E', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 10, fontWeight: 'bold' },
+  recommendedBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#FEF08A', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 10 },
+  recommendedBadgeText: { fontSize: 11, color: '#854D0E', fontWeight: 'bold' },
+  narrativeBadge: { flexDirection: 'row', alignItems: 'center', alignSelf: 'center', gap: 6, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16, marginBottom: 12 },
+  narrativeBadgeText: { fontSize: 12, fontWeight: '700', letterSpacing: 0.3 },
   modalContainer: { flex: 1, backgroundColor: "#F8F9FA" },
   readerContent: { flex: 1, padding: 24, justifyContent: 'space-between', alignItems: 'center' },
   dotsRow: { flexDirection: 'row', gap: 8, marginBottom: 20 },
@@ -408,12 +511,12 @@ const styles = StyleSheet.create({
   cardScrollView: { flexGrow: 1, justifyContent: 'center' },
   cardText: { fontSize: 18, color: '#374151', textAlign: 'center', lineHeight: 28, fontWeight: '500' },
   cardCounter: { textAlign: 'center', fontSize: 13, color: '#9CA3AF', marginTop: 16, fontWeight: '600' },
-  actionsFooter: { flexDirection: 'row', width: '100%', justifyContent: 'space-between', alignItems: 'center', height: 52 },
-  navBtn: { flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: 20, borderRadius: 12, backgroundColor: '#E0F2FE', gap: 6 },
+  actionsFooter: { flexDirection: 'row', width: '100%', justifyContent: 'space-between', alignItems: 'center', minHeight: 48 },
+  navBtn: { minHeight: 48, flexDirection: 'row', alignItems: 'center', paddingVertical: 12, paddingHorizontal: 20, borderRadius: 12, backgroundColor: '#E0F2FE', gap: 6 },
   navBtnDisabled: { backgroundColor: '#F3F4F6' },
   navBtnText: { fontSize: 16, fontWeight: '600', color: '#0284C7' },
   navBtnTextDisabled: { color: '#9CA3AF' },
-  quizStartBtn: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#10B981', paddingVertical: 12, paddingHorizontal: 24, borderRadius: 12 },
+  quizStartBtn: { minHeight: 48, flexDirection: 'row', alignItems: 'center', backgroundColor: '#10B981', paddingVertical: 12, paddingHorizontal: 24, borderRadius: 12 },
   quizStartBtnText: { color: 'white', fontSize: 16, fontWeight: 'bold' },
   aslFloatBtn: {
     position: 'absolute', bottom: 85, right: 20,

@@ -1,7 +1,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import { router, useFocusEffect } from "expo-router";
-import React, { useState, useCallback } from 'react';
-import { SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, View } from "react-native";
+import React, { useState, useCallback, useEffect, useRef } from 'react';
+import { SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, View, Animated, Platform } from "react-native";
 import { useAuth } from "../../context/AuthContext";
 import { useSubjects } from "../../context/SubjectsContext";
 import { API_URL } from "../../context/config";
@@ -16,6 +16,38 @@ export default function HomeScreen() {
   const [streak, setStreak] = useState<number>(0);
   const [topicProgress, setTopicProgress] = useState<{ [topicId: string]: { stars: number; progress: number } }>({});
 
+  // Subtle Flame Flicker / Pulse for active study streak
+  const flameAnim = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    const flameLoop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(flameAnim, {
+          toValue: 1.16,
+          duration: 750,
+          useNativeDriver: Platform.OS !== 'web',
+        }),
+        Animated.timing(flameAnim, {
+          toValue: 0.96,
+          duration: 600,
+          useNativeDriver: Platform.OS !== 'web',
+        }),
+        Animated.timing(flameAnim, {
+          toValue: 1.10,
+          duration: 650,
+          useNativeDriver: Platform.OS !== 'web',
+        }),
+        Animated.timing(flameAnim, {
+          toValue: 1.0,
+          duration: 700,
+          useNativeDriver: Platform.OS !== 'web',
+        }),
+      ])
+    );
+    flameLoop.start();
+    return () => flameLoop.stop();
+  }, [flameAnim]);
+
   const fetchHomeSummary = useCallback(async () => {
     try {
       const res = await fetch(`${API_URL}/student/${userId}/home-summary`);
@@ -25,9 +57,15 @@ export default function HomeScreen() {
         setStreak(data.current_streak ?? 0);
         if (data.topics) {
           const map: { [topicId: string]: { stars: number; progress: number } } = {};
-          data.topics.forEach((t: any) => {
-            map[t.topic_id] = { stars: t.stars_earned || 0, progress: t.progress_pct || 0 };
-          });
+          if (Array.isArray(data.topics)) {
+            data.topics.forEach((t: any) => {
+              map[t.topic_id] = { stars: t.stars_earned ?? t.stars ?? 0, progress: t.progress_pct ?? t.progress ?? 0 };
+            });
+          } else if (typeof data.topics === 'object') {
+            Object.entries(data.topics).forEach(([topicId, t]: [string, any]) => {
+              map[topicId] = { stars: t.stars_earned ?? t.stars ?? 0, progress: t.progress_pct ?? t.progress ?? 0 };
+            });
+          }
           setTopicProgress(map);
         }
       }
@@ -44,7 +82,7 @@ export default function HomeScreen() {
 
   // Load English subjects category and topics dynamically
   const englishSubject = subjects['english'];
-  const categoryName = englishSubject?.categories[0]?.name ?? "English Lessons";
+  const categoryName = englishSubject?.categories[0]?.name ?? "Core Learning Modules";
   const topics = englishSubject?.categories[0]?.topics ?? [];
 
   return (
@@ -85,7 +123,9 @@ export default function HomeScreen() {
           >
             <View style={styles.statCardHeader}>
               <Text style={styles.statTitle}>Streak</Text>
-              <Ionicons name="flame-outline" size={20} color="#EA580C" />
+              <Animated.View style={streak > 0 ? { transform: [{ scale: flameAnim }] } : null}>
+                <Ionicons name={streak > 0 ? "flame" : "flame-outline"} size={20} color="#EA580C" />
+              </Animated.View>
             </View>
             <Text style={[styles.starsCount, { color: '#EA580C' }]}>{streak} <Text style={styles.daysText}>days</Text></Text>
             <View style={styles.cardFooterHint}>
@@ -94,6 +134,22 @@ export default function HomeScreen() {
             </View>
           </TouchableOpacity>
         </View>
+
+        {/* Flashcards Practice Banner */}
+        <TouchableOpacity
+          style={styles.flashcardBanner}
+          activeOpacity={0.85}
+          onPress={() => router.push("/flashcards" as any)}
+        >
+          <View style={styles.flashcardIconBg}>
+            <Ionicons name="albums-outline" size={22} color="#7C3AED" />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.flashcardTitle}>Visual Flashcard Practice</Text>
+            <Text style={styles.flashcardSub}>Practice Cross-Curricular ASL vocabulary</Text>
+          </View>
+          <Ionicons name="chevron-forward" size={18} color="#7C3AED" />
+        </TouchableOpacity>
 
         {/* Subjects Section */}
         <Text style={styles.sectionTitle}>{categoryName}</Text>
@@ -216,6 +272,40 @@ const styles = StyleSheet.create({
     fontSize: 11,
     fontWeight: '600',
     color: 'rgba(255, 255, 255, 0.9)',
+  },
+  flashcardBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FAF5FF',
+    borderRadius: 16,
+    padding: 14,
+    marginBottom: 24,
+    borderWidth: 1.5,
+    borderColor: '#EDE9FE',
+    gap: 12,
+  },
+  flashcardIconBg: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'white',
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#7C3AED',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 3,
+    elevation: 1,
+  },
+  flashcardTitle: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#1F2937',
+  },
+  flashcardSub: {
+    fontSize: 12,
+    color: '#6B7280',
+    marginTop: 2,
   },
   sectionTitle: {
     fontSize: 20,

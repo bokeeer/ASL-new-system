@@ -14,6 +14,21 @@ import uuid
 import random
 from datetime import datetime
 
+# Load .env file using standard library
+def load_env_file():
+    if os.path.exists(".env"):
+        try:
+            with open(".env", "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        os.environ.setdefault(k.strip(), v.strip())
+        except Exception:
+            pass
+
+load_env_file()
+
 app = FastAPI()
 
 # Mount static folder uploads to serve files
@@ -33,11 +48,11 @@ app.add_middleware(
 # ── Database connection ───────────────────────────────────────────────────────
 def get_db():
     return psycopg2.connect(
-        host="localhost",
-        database="postgres",
-        user="postgres",
-        password="bokeeer03",
-        port=5432,
+        host=os.getenv("DB_HOST", "localhost"),
+        database=os.getenv("DB_NAME", "postgres"),
+        user=os.getenv("DB_USER", "postgres"),
+        password=os.getenv("DB_PASSWORD", "bokeeer03"),
+        port=int(os.getenv("DB_PORT", "5432")),
     )
 
 # ── Database init — Milestone 1 ───────────────────────────────────────────────
@@ -182,10 +197,11 @@ def init_db():
             );
         """)
 
-        # Add KC column to questions if missing
+        # Add KC and hint columns to questions if missing
         cur.execute("""
             ALTER TABLE questions
-                ADD COLUMN IF NOT EXISTS knowledge_component VARCHAR(100);
+                ADD COLUMN IF NOT EXISTS knowledge_component VARCHAR(100),
+                ADD COLUMN IF NOT EXISTS hint TEXT;
         """)
 
         # ── Phase 3: Streak & Daily Quiz tables ──────────────────────────────
@@ -1534,16 +1550,49 @@ def get_home_summary(user_id: int):
         longest_streak = streak_row["longest_streak"] if streak_row else 0
         active_today = bool(streak_row and streak_row["last_activity_date"] == today)
 
-        # 3. Topic progress
+        # 3. Topic progress: calculate passed lessons / total lessons per topic
+        cur.execute("""
+            SELECT 
+                lg.topic_id,
+                COUNT(DISTINCT l.id) AS total_lessons,
+                COUNT(DISTINCT CASE 
+                    WHEN l.difficulty = 'easy' AND slp.easy_passed THEN l.id
+                    WHEN l.difficulty = 'medium' AND slp.medium_passed THEN l.id
+                    WHEN l.difficulty = 'hard' AND slp.hard_passed THEN l.id
+                    ELSE NULL 
+                END) AS passed_lessons
+            FROM lessons l
+            JOIN lesson_groups lg ON l.lesson_group_id = lg.id
+            LEFT JOIN student_lesson_progress slp ON lg.id = slp.lesson_group_id AND slp.user_id = %s
+            GROUP BY lg.topic_id
+        """, (user_id,))
+        progress_rows = cur.fetchall()
+        progress_by_topic = {}
+        for r in progress_rows:
+            tot = r["total_lessons"] or 0
+            passed = r["passed_lessons"] or 0
+            pct = round((passed / tot * 100), 1) if tot > 0 else 0.0
+            progress_by_topic[r["topic_id"]] = pct
+
         cur.execute("SELECT * FROM student_profiles WHERE user_id = %s", (user_id,))
         profiles = cur.fetchall()
-        topic_map = {}
-        for p in profiles:
-            topic_map[p["topic_id"]] = {
-                "stars": p["total_stars"],
-                "accuracy": round(p["avg_accuracy"], 1),
-                "quizzes_completed": p["quizzes_completed"]
+        stars_by_topic = {p["topic_id"]: p["total_stars"] for p in profiles}
+
+        topics_list = []
+        topics_map = {}
+        all_topic_ids = set(list(progress_by_topic.keys()) + list(stars_by_topic.keys()))
+        for tid in all_topic_ids:
+            pct = progress_by_topic.get(tid, 0.0)
+            stars = stars_by_topic.get(tid, 0)
+            entry = {
+                "topic_id": tid,
+                "stars_earned": stars,
+                "progress_pct": int(pct),
+                "progress": int(pct),
+                "stars": stars
             }
+            topics_list.append(entry)
+            topics_map[tid] = entry
 
         cur.close()
         conn.close()
@@ -1554,7 +1603,8 @@ def get_home_summary(user_id: int):
             "current_streak": current_streak,
             "longest_streak": longest_streak,
             "active_today": active_today,
-            "topics": topic_map
+            "topics": topics_list,
+            "topic_map": topics_map
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -2386,13 +2436,13 @@ def get_student_badges(user_id: int):
         """, (user_id,))
         story_explorer = cur.fetchone() is not None
 
-        # 6. Literacy Champ: passed English Literacy easy
+        # 6. Curriculum Pioneer: passed any STEM/TLE/AP easy lesson
         cur.execute("""
             SELECT slp.easy_passed FROM student_lesson_progress slp 
             JOIN lesson_groups lg ON slp.lesson_group_id = lg.id 
-            WHERE slp.user_id = %s AND lg.topic_id = 'english-literacy' AND slp.easy_passed = TRUE LIMIT 1
+            WHERE slp.user_id = %s AND lg.topic_id IN ('mathematics', 'technology-and-livelihood-education', 'araling-panlipunan', 'english-literacy') AND slp.easy_passed = TRUE LIMIT 1
         """, (user_id,))
-        literacy_champ = cur.fetchone() is not None
+        curriculum_pioneer = cur.fetchone() is not None
 
         cur.close()
         conn.close()
@@ -2440,11 +2490,11 @@ def get_student_badges(user_id: int):
             },
             {
                 "id": "literacy_champ",
-                "title": "Literacy Champ",
-                "description": "Pass your first English Literacy lesson.",
-                "icon": "reader-outline",
-                "color": "#0D9488",
-                "unlocked": bool(literacy_champ),
+                "title": "Curriculum Pioneer",
+                "description": "Pass your first Mathematics, TLE, or Araling Panlipunan lesson.",
+                "icon": "shapes-outline",
+                "color": "#2563EB",
+                "unlocked": bool(curriculum_pioneer),
             }
         ]
         return badges
@@ -2603,4 +2653,387 @@ def get_admin_analytics_overview():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Phase 6: Visual Flashcards & Admin Quiz Question Editor ───────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+FLASHCARDS_DATA = {
+    "story-grammar": [
+        {
+            "id": 1,
+            "term": "Character",
+            "asl_gloss": "WHO STORY ABOUT (PERSON / ANIMAL)",
+            "definition": "The person, animal, or creature the story is about.",
+            "example": "Leo the puppy is the main character in the story.",
+            "category": "Story Element",
+            "icon": "person-outline",
+            "color": "#7C3AED"
+        },
+        {
+            "id": 2,
+            "term": "Setting",
+            "asl_gloss": "WHERE + WHEN STORY HAPPEN",
+            "definition": "The place and time where the story happens.",
+            "example": "The story takes place in a sunny green park.",
+            "category": "Story Element",
+            "icon": "location-outline",
+            "color": "#7C3AED"
+        },
+        {
+            "id": 3,
+            "term": "Problem",
+            "asl_gloss": "TROUBLE / CONFLICT / SOMETHING WRONG",
+            "definition": "The trouble or challenge that the character must solve.",
+            "example": "Leo is lost after chasing a butterfly.",
+            "category": "Story Element",
+            "icon": "alert-circle-outline",
+            "color": "#7C3AED"
+        },
+        {
+            "id": 4,
+            "term": "Resolution",
+            "asl_gloss": "PROBLEM SOLVE / ENDING HAPPY",
+            "definition": "How the problem is solved and how the story ends.",
+            "example": "Mia helps Leo find his way back home.",
+            "category": "Story Element",
+            "icon": "checkmark-circle-outline",
+            "color": "#7C3AED"
+        },
+        {
+            "id": 5,
+            "term": "First (Sequence)",
+            "asl_gloss": "FIRST (BEGINNING)",
+            "definition": "What happens at the beginning of the story.",
+            "example": "First, Leo plays happily in the park.",
+            "category": "Sequence Word",
+            "icon": "arrow-forward-circle-outline",
+            "color": "#7C3AED"
+        },
+        {
+            "id": 6,
+            "term": "Finally (Sequence)",
+            "asl_gloss": "FINALLY (END RESULT)",
+            "definition": "What happens at the very end of the story.",
+            "example": "Finally, Leo is safe at home with his family.",
+            "category": "Sequence Word",
+            "icon": "flag-outline",
+            "color": "#7C3AED"
+        }
+    ],
+    "mathematics": [
+        {
+            "id": 201,
+            "term": "Translation (Slide)",
+            "asl_gloss": "SHAPE SLIDE (STRAIGHT LINE MOVE)",
+            "definition": "Moving a shape in a straight line without turning or resizing it.",
+            "example": "Leo translated the blue triangle 4 units to the right.",
+            "category": "Transformation",
+            "icon": "arrow-forward-outline",
+            "color": "#2563EB"
+        },
+        {
+            "id": 202,
+            "term": "Reflection (Flip)",
+            "asl_gloss": "SHAPE FLIP (MIRROR OPPOSITE)",
+            "definition": "Flipping a shape across a line to produce a mirror image.",
+            "example": "The arrow flips across the vertical line of symmetry.",
+            "category": "Transformation",
+            "icon": "swap-horizontal-outline",
+            "color": "#2563EB"
+        },
+        {
+            "id": 203,
+            "term": "Rotation (Turn)",
+            "asl_gloss": "SHAPE TURN (SPIN AROUND CENTER POINT)",
+            "definition": "Turning a shape around a fixed center point by degrees (90° or 180°).",
+            "example": "Turning the yellow star 90 degrees clockwise.",
+            "category": "Transformation",
+            "icon": "refresh-outline",
+            "color": "#2563EB"
+        },
+        {
+            "id": 204,
+            "term": "Line of Symmetry",
+            "asl_gloss": "MIDDLE LINE (BOTH SIDES MATCH SAME)",
+            "definition": "The imaginary mirror line where a shape can be folded into two identical halves.",
+            "example": "The vertical mirror line shows both sides are identical.",
+            "category": "Geometry",
+            "icon": "git-commit-outline",
+            "color": "#2563EB"
+        },
+        {
+            "id": 205,
+            "term": "Congruent Shapes",
+            "asl_gloss": "SHAPE SAME-SIZE + SAME-SHAPE",
+            "definition": "Shapes that have the exact same size and shape after transforming.",
+            "example": "The translated triangle is congruent to the original triangle.",
+            "category": "Geometry",
+            "icon": "shapes-outline",
+            "color": "#2563EB"
+        },
+        {
+            "id": 206,
+            "term": "Coordinate Grid",
+            "asl_gloss": "GRID MAP (X HORIZONTAL + Y VERTICAL)",
+            "definition": "A network of horizontal and vertical lines used to pinpoint shape positions.",
+            "example": "Leo plotted the triangle vertices on the 2D grid.",
+            "category": "Measurement",
+            "icon": "grid-outline",
+            "color": "#2563EB"
+        }
+    ],
+    "technology-and-livelihood-education": [
+        {
+            "id": 301,
+            "term": "Webcam Privacy",
+            "asl_gloss": "CAMERA PRIVACY (HIDE PERSONAL ROOM)",
+            "definition": "Keeping personal living areas hidden during a video conference.",
+            "example": "Mia applies a blurred virtual background before turning on her camera.",
+            "category": "Digital Privacy",
+            "icon": "videocam-outline",
+            "color": "#D97706"
+        },
+        {
+            "id": 302,
+            "term": "Mute Microphone",
+            "asl_gloss": "MIC OFF (NO NOISE DISTURB)",
+            "definition": "Turning off your microphone when listening to avoid background noise.",
+            "example": "Always mute your mic when the teacher or classmates are signing or speaking.",
+            "category": "Etiquette",
+            "icon": "mic-off-outline",
+            "color": "#D97706"
+        },
+        {
+            "id": 303,
+            "term": "Meeting Link",
+            "asl_gloss": "CONFERENCE LINK (NEVER SHARE PUBLIC)",
+            "definition": "The digital address used to join an online classroom.",
+            "example": "Only share the class meeting link with trusted school classmates.",
+            "category": "Cybersecurity",
+            "icon": "link-outline",
+            "color": "#D97706"
+        },
+        {
+            "id": 304,
+            "term": "Password Protection",
+            "asl_gloss": "SECRET CODE (LOCK ACCOUNT SAFE)",
+            "definition": "A secret security code used to protect accounts and meetings from strangers.",
+            "example": "Mia keeps her meeting passcode confidential.",
+            "category": "Cybersecurity",
+            "icon": "lock-closed-outline",
+            "color": "#D97706"
+        },
+        {
+            "id": 305,
+            "term": "Visual Clarity",
+            "asl_gloss": "LIGHT GOOD + HAND CLEAR (EASY SEE SIGN)",
+            "definition": "Good front-facing lighting so hand signs and facial expressions are easy to see.",
+            "example": "Face the light source so your sign language is bright and clear.",
+            "category": "Visual Communication",
+            "icon": "sunny-outline",
+            "color": "#D97706"
+        },
+        {
+            "id": 306,
+            "term": "Chat Etiquette",
+            "asl_gloss": "MESSAGE POLITE + RESPECTFUL (NO SPAM)",
+            "definition": "Typing polite, relevant, and school-appropriate messages in the meeting chat.",
+            "example": "Use the chat box only for asking questions related to the lesson.",
+            "category": "Etiquette",
+            "icon": "chatbubble-ellipses-outline",
+            "color": "#D97706"
+        }
+    ],
+    "araling-panlipunan": [
+        {
+            "id": 401,
+            "term": "Katipunan (KKK)",
+            "asl_gloss": "KATIPUNAN (SECRET BROTHERHOOD FOR FREEDOM)",
+            "definition": "The secret revolutionary society founded to free the Philippines from Spanish rule.",
+            "example": "The Katipunan united Filipinos under a common vision of liberty.",
+            "category": "History",
+            "icon": "shield-checkmark-outline",
+            "color": "#059669"
+        },
+        {
+            "id": 402,
+            "term": "Andres Bonifacio",
+            "asl_gloss": "ANDRES BONIFACIO (SUPREMO / FATHER OF REVOLUTION)",
+            "definition": "The brave founder and leader (Supremo) of the Katipunan born in Tondo, Manila.",
+            "example": "Andres Bonifacio inspired the people with his courage and love of country.",
+            "category": "Historical Hero",
+            "icon": "person-outline",
+            "color": "#059669"
+        },
+        {
+            "id": 403,
+            "term": "Sanduguan (Blood Compact)",
+            "asl_gloss": "BLOOD COMPACT (PROMISE BROTHERHOOD TOGETHER)",
+            "definition": "A sacred ritual where members signed their oath in blood to seal their loyalty.",
+            "example": "Katipuneros performed the Sanduguan to pledge their lives for freedom.",
+            "category": "Historical Ritual",
+            "icon": "heart-outline",
+            "color": "#059669"
+        },
+        {
+            "id": 404,
+            "term": "Kartilya ng Katipunan",
+            "asl_gloss": "KARTILYA (MORAL TEACHINGS / RULES FOR GOOD LIFE)",
+            "definition": "The code of ethics written by Emilio Jacinto teaching equality, honor, and defending the weak.",
+            "example": "The Kartilya taught that all human beings are equal regardless of wealth.",
+            "category": "Moral Teachings",
+            "icon": "document-text-outline",
+            "color": "#059669"
+        },
+        {
+            "id": 405,
+            "term": "Kalayaan (Freedom)",
+            "asl_gloss": "FREEDOM / INDEPENDENCE (NO OPPRESSION)",
+            "definition": "The right to live in liberty, self-governance, and freedom from colonial rule.",
+            "example": "The supreme goal of the Katipuneros was to achieve Kalayaan for the country.",
+            "category": "Civic Concept",
+            "icon": "flag-outline",
+            "color": "#059669"
+        },
+        {
+            "id": 406,
+            "term": "Gregoria de Jesus",
+            "asl_gloss": "GREGORIA DE JESUS (LAKAMBINI / BRAVE WOMAN LEADER)",
+            "definition": "The Lakambini of the Katipunan who bravely guarded secret society archives and weapons.",
+            "example": "Gregoria de Jesus led the women's chapter and protected the Katipunan seal.",
+            "category": "Historical Hero",
+            "icon": "star-outline",
+            "color": "#059669"
+        }
+    ]
+}
+
+@app.get("/flashcards/{topic_id}")
+def get_flashcards(topic_id: str):
+    cards = FLASHCARDS_DATA.get(topic_id, [])
+    if not cards:
+        cards = FLASHCARDS_DATA.get("story-grammar", [])
+    return {"topic_id": topic_id, "cards": cards}
+
+
+class EditQuestionItem(BaseModel):
+    id: Optional[int] = None
+    question_text: str
+    question_type: str = "descriptive"
+    image_url: Optional[str] = None
+    knowledge_component: Optional[str] = None
+    options: List[str] = []
+    correct_option_index: int = 0
+    hint: Optional[str] = None
+    matching_pairs: Optional[List[dict]] = None
+
+class UpdateQuizQuestionsRequest(BaseModel):
+    questions: List[EditQuestionItem]
+
+
+@app.get("/admin/quiz/{quiz_id}/questions")
+def get_admin_quiz_questions(quiz_id: int):
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM questions WHERE quiz_id = %s ORDER BY id ASC", (quiz_id,))
+        rows = cur.fetchall()
+        
+        result = []
+        for r in rows:
+            q_id = r["id"]
+            q_type = r["question_type"]
+            options_list = []
+            matching_pairs_list = []
+            
+            if q_type == 'matching':
+                cur.execute(
+                    "SELECT left_item, right_item FROM question_matches WHERE question_id = %s ORDER BY id ASC",
+                    (q_id,)
+                )
+                matches = cur.fetchall()
+                matching_pairs_list = [{"left": m["left_item"], "right": m["right_item"]} for m in matches]
+            else:
+                cur.execute(
+                    "SELECT option_letter, option_text FROM question_options WHERE question_id = %s ORDER BY option_letter ASC",
+                    (q_id,)
+                )
+                opts = cur.fetchall()
+                options_list = [o["option_text"] for o in opts]
+                
+            correct_letter = r["correct_option_letter"] or "A"
+            correct_idx = ord(correct_letter.upper()) - 65 if len(correct_letter) == 1 and correct_letter.isalpha() else 0
+            
+            result.append({
+                "id": q_id,
+                "quiz_id": r["quiz_id"],
+                "question_text": r["question_text"],
+                "question_type": q_type,
+                "image_url": r["image_url"],
+                "knowledge_component": r.get("knowledge_component") or "",
+                "options": options_list,
+                "correct_option_index": correct_idx,
+                "hint": r.get("hint") or "",
+                "matching_pairs": matching_pairs_list,
+            })
+            
+        cur.close()
+        conn.close()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/admin/quiz/{quiz_id}/questions")
+def update_admin_quiz_questions(quiz_id: int, req: UpdateQuizQuestionsRequest):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        
+        # 1. Fetch old question IDs to delete options and matches
+        cur.execute("SELECT id FROM questions WHERE quiz_id = %s", (quiz_id,))
+        old_ids = [row[0] for row in cur.fetchall()]
+        if old_ids:
+            cur.execute("DELETE FROM question_options WHERE question_id = ANY(%s)", (old_ids,))
+            cur.execute("DELETE FROM question_matches WHERE question_id = ANY(%s)", (old_ids,))
+            cur.execute("DELETE FROM questions WHERE quiz_id = %s", (quiz_id,))
+            
+        # 2. Insert new questions
+        for q in req.questions:
+            if not q.question_text.strip():
+                continue
+            correct_letter = chr(65 + (q.correct_option_index or 0))
+            cur.execute("""
+                INSERT INTO questions 
+                (quiz_id, question_text, correct_option_letter, question_type, image_url, knowledge_component, hint)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                quiz_id,
+                q.question_text.strip(),
+                correct_letter,
+                q.question_type or "descriptive",
+                q.image_url if q.image_url and q.image_url.strip() else None,
+                q.knowledge_component if q.knowledge_component and q.knowledge_component.strip() else None,
+                q.hint if q.hint and q.hint.strip() else None,
+            ))
+            new_q_id = cur.fetchone()[0]
+            
+            # Insert options
+            for o_idx, opt_text in enumerate(q.options):
+                opt_letter = chr(65 + o_idx)
+                cur.execute("""
+                    INSERT INTO question_options (question_id, option_letter, option_text)
+                    VALUES (%s, %s, %s)
+                """, (new_q_id, opt_letter, opt_text.strip()))
+                
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"success": True, "message": f"Successfully updated {len(req.questions)} questions."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 

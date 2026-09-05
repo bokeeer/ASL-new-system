@@ -8,7 +8,8 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "backend": "\"C:\\Users\\Radny\\AppData\\Local\\Programs\\Python\\Python311\\Scripts\\uvicorn.exe\" server:app --host 0.0.0.0 --port 8000 --reload"
   },
   "dependencies": {
     "@expo/vector-icons": "^15.0.3",

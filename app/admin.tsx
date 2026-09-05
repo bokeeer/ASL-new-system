@@ -88,6 +88,14 @@ export default function AdminScreen() {
   const [submittingKC, setSubmittingKC] = useState(false);
   const [fittingModel, setFittingModel] = useState(false);
 
+  // Phase 6 Quiz Editing state
+  const [existingQuizzes, setExistingQuizzes] = useState<any[]>([]);
+  const [loadingQuizzes, setLoadingQuizzes] = useState(false);
+  const [editingQuiz, setEditingQuiz] = useState<any | null>(null);
+  const [editingQuizQuestions, setEditingQuizQuestions] = useState<any[]>([]);
+  const [loadingEditingQuiz, setLoadingEditingQuiz] = useState(false);
+  const [savingEditingQuiz, setSavingEditingQuiz] = useState(false);
+
   // Edit Existing Lesson Slides state
   const [editingLesson, setEditingLesson] = useState<{ id: number; title: string; difficulty: string; groupTitle: string } | null>(null);
   const [editingSlides, setEditingSlides] = useState<{ description_text: string; image_url: string }[]>([]);
@@ -207,6 +215,192 @@ export default function AdminScreen() {
       showAlert("Error", err.message || "Failed to update slides.");
     } finally {
       setSavingEditingSlides(false);
+    }
+  };
+
+  const fetchQuizzes = async (topicId: string) => {
+    setLoadingQuizzes(true);
+    try {
+      const res = await fetch(`${API_URL}/topic/${topicId}?user_id=1`);
+      if (res.ok) {
+        const data = await res.json();
+        const quizzes: any[] = [];
+        (data.lesson_groups || []).forEach((g: any) => {
+          (g.lessons || []).forEach((l: any) => {
+            if (l.quiz_id) {
+              quizzes.push({
+                id: l.quiz_id,
+                title: `${g.title} (${l.difficulty.toUpperCase()})`,
+                difficulty: l.difficulty,
+                groupTitle: g.title,
+                questionCount: l.quiz_question_count || 0,
+              });
+            }
+          });
+        });
+        setExistingQuizzes(quizzes);
+      }
+    } catch {
+      /* silent */
+    } finally {
+      setLoadingQuizzes(false);
+    }
+  };
+
+  useEffect(() => {
+    if (selectedTopicId) {
+      fetchQuizzes(selectedTopicId);
+    }
+  }, [selectedTopicId, activeTab]);
+
+  const openEditQuiz = async (quiz: any) => {
+    setEditingQuiz(quiz);
+    setLoadingEditingQuiz(true);
+    try {
+      const res = await fetch(`${API_URL}/admin/quiz/${quiz.id}/questions`);
+      if (res.ok) {
+        const data = await res.json();
+        setEditingQuizQuestions(data.map((q: any) => ({
+          id: q.id,
+          question_text: q.question_text || '',
+          question_type: q.question_type || 'descriptive',
+          image_url: q.image_url || '',
+          knowledge_component: q.knowledge_component || '',
+          options: q.options && q.options.length > 0 ? q.options : ['', '', '', ''],
+          correct_option_index: q.correct_option_index || 0,
+          hint: q.hint || '',
+          matching_pairs: q.matching_pairs || [{ left: '', right: '' }]
+        })));
+      } else {
+        setEditingQuizQuestions([]);
+      }
+    } catch {
+      setEditingQuizQuestions([]);
+    } finally {
+      setLoadingEditingQuiz(false);
+    }
+  };
+
+  const handleEditQuizQuestionText = (text: string, index: number) => {
+    const updated = [...editingQuizQuestions];
+    updated[index].question_text = text;
+    setEditingQuizQuestions(updated);
+  };
+
+  const handleEditQuizHint = (text: string, index: number) => {
+    const updated = [...editingQuizQuestions];
+    updated[index].hint = text;
+    setEditingQuizQuestions(updated);
+  };
+
+  const handleEditQuizOption = (text: string, qIdx: number, oIdx: number) => {
+    const updated = [...editingQuizQuestions];
+    updated[qIdx].options[oIdx] = text;
+    setEditingQuizQuestions(updated);
+  };
+
+  const handleSetCorrectOption = (qIdx: number, oIdx: number) => {
+    const updated = [...editingQuizQuestions];
+    updated[qIdx].correct_option_index = oIdx;
+    setEditingQuizQuestions(updated);
+  };
+
+  const pickQuizQuestionImage = async (index: number) => {
+    const permResult = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permResult.granted) {
+      showAlert("Permission Required", "Camera roll permission is needed to select an image.");
+      return;
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      quality: 0.8,
+    });
+    if (!result.canceled && result.assets[0]) {
+      uploadQuizQuestionImage(result.assets[0].uri, index);
+    }
+  };
+
+  const uploadQuizQuestionImage = async (uri: string, index: number) => {
+    try {
+      const formData = new FormData();
+      const filename = uri.split('/').pop() || 'upload.jpg';
+      const match = /\.(\w+)$/.exec(filename);
+      const type = match ? `image/${match[1]}` : `image/jpeg`;
+
+      if (Platform.OS === 'web') {
+        const response = await fetch(uri);
+        const blob = await response.blob();
+        formData.append('file', blob, filename);
+      } else {
+        formData.append('file', { uri, name: filename, type } as any);
+      }
+
+      const res = await fetch(`${API_URL}/admin/upload`, {
+        method: 'POST',
+        body: formData,
+      });
+      if (!res.ok) throw new Error("Upload failed");
+      const data = await res.json();
+      const updated = [...editingQuizQuestions];
+      updated[index].image_url = data.url;
+      setEditingQuizQuestions(updated);
+    } catch (err: any) {
+      showAlert("Upload Error", err.message || "Could not upload image.");
+    }
+  };
+
+  const handleRemoveQuizQuestionImage = (index: number) => {
+    const updated = [...editingQuizQuestions];
+    updated[index].image_url = '';
+    setEditingQuizQuestions(updated);
+  };
+
+  const handleAddQuizQuestion = () => {
+    setEditingQuizQuestions([
+      ...editingQuizQuestions,
+      {
+        question_text: '',
+        question_type: 'descriptive',
+        image_url: '',
+        knowledge_component: '',
+        options: ['', '', '', ''],
+        correct_option_index: 0,
+        hint: '',
+        matching_pairs: [{ left: '', right: '' }]
+      }
+    ]);
+  };
+
+  const handleRemoveQuizQuestion = (index: number) => {
+    if (editingQuizQuestions.length <= 1) {
+      showAlert("Warning", "A quiz must have at least one question.");
+      return;
+    }
+    setEditingQuizQuestions(editingQuizQuestions.filter((_, i) => i !== index));
+  };
+
+  const handleSaveQuizQuestions = async () => {
+    if (!editingQuiz) return;
+    const valid = editingQuizQuestions.filter(q => q.question_text.trim() !== '');
+    if (valid.length === 0) {
+      showAlert("Error", "Please provide at least one valid question with text.");
+      return;
+    }
+    setSavingEditingQuiz(true);
+    try {
+      const res = await fetch(`${API_URL}/admin/quiz/${editingQuiz.id}/questions`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ questions: valid }),
+      });
+      if (!res.ok) throw new Error("Failed to update quiz questions.");
+      showAlert("Success", `Quiz "${editingQuiz.title}" updated successfully!`);
+      setEditingQuiz(null);
+      fetchQuizzes(selectedTopicId);
+    } catch (err: any) {
+      showAlert("Error", err.message || "Failed to update questions.");
+    } finally {
+      setSavingEditingQuiz(false);
     }
   };
 
@@ -613,7 +807,7 @@ export default function AdminScreen() {
                         styles.diffChipText,
                         difficulty === diff && styles.diffChipTextActive
                       ]}>
-                        {diff === 'easy' ? '🟢 Easy' : diff === 'medium' ? '🟡 Medium' : '🔴 Hard'}
+                        {diff === 'easy' ? 'Easy' : diff === 'medium' ? 'Medium' : 'Hard'}
                       </Text>
                     </TouchableOpacity>
                   ))}
@@ -709,7 +903,7 @@ export default function AdminScreen() {
                           return (
                             <View key={diff} style={styles.tierRow}>
                               <Text style={styles.tierName}>
-                                {diff === 'easy' ? '🟢 Easy' : diff === 'medium' ? '🟡 Medium' : '🔴 Hard'}
+                                {diff === 'easy' ? 'Easy' : diff === 'medium' ? 'Medium' : 'Hard'}
                               </Text>
 
                               {found ? (
@@ -719,7 +913,10 @@ export default function AdminScreen() {
                                       {found.slide_count} slides • Quiz: {found.quiz_question_count} Qs
                                     </Text>
                                     {isWarn && (
-                                      <Text style={styles.warnBadge}>⚠️ &lt;10 Qs</Text>
+                                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 3 }}>
+                                        <Ionicons name="alert-circle-outline" size={12} color="#B45309" />
+                                        <Text style={styles.warnBadge}>&lt;10 Qs</Text>
+                                      </View>
                                     )}
                                   </View>
                                   <TouchableOpacity
@@ -881,6 +1078,40 @@ export default function AdminScreen() {
                   {submittingQuiz ? <ActivityIndicator color="white" /> : <Text style={styles.submitBtnText}>Save Quiz</Text>}
                 </TouchableOpacity>
               </View>
+
+              {/* Existing Quizzes for Selected Topic */}
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>Existing Quizzes ({selectedTopic?.name})</Text>
+                <Text style={{ fontSize: 13, color: '#6B7280', marginBottom: 16 }}>
+                  View and edit questions, options, hints, and illustrations for each lesson quiz.
+                </Text>
+
+                {loadingQuizzes ? (
+                  <ActivityIndicator color="#0284C7" style={{ marginVertical: 20 }} />
+                ) : existingQuizzes.length === 0 ? (
+                  <Text style={styles.emptyText}>No quizzes created yet for this topic.</Text>
+                ) : (
+                  existingQuizzes.map((quiz) => (
+                    <View key={quiz.id} style={styles.groupCard}>
+                      <View style={styles.groupHeader}>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.groupTitle}>{quiz.title}</Text>
+                          <Text style={styles.groupSub}>
+                            {quiz.questionCount} questions in pool • Difficulty: {quiz.difficulty.toUpperCase()}
+                          </Text>
+                        </View>
+                        <TouchableOpacity
+                          style={styles.editTierBtn}
+                          onPress={() => openEditQuiz(quiz)}
+                        >
+                          <Ionicons name="create-outline" size={14} color="#0284C7" />
+                          <Text style={styles.editTierBtnText}>Edit Questions & Images</Text>
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+                  ))
+                )}
+              </View>
             </View>
           )}
 
@@ -1010,31 +1241,25 @@ export default function AdminScreen() {
                   <View style={styles.card}>
                     <Text style={styles.cardTitle}>Topic Performance</Text>
                     <View style={{ gap: 10 }}>
-                      <View style={styles.topicPerfCard}>
-                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                          <Ionicons name="book-outline" size={20} color="#7C3AED" />
-                          <Text style={styles.topicPerfTitle}>Story Grammar</Text>
-                        </View>
-                        <Text style={styles.topicPerfStats}>
-                          {analyticsData.topic_stats?.['story-grammar']?.attempts || 0} attempts •{' '}
-                          <Text style={{ fontWeight: 'bold', color: '#7C3AED' }}>
-                            {analyticsData.topic_stats?.['story-grammar']?.avg_accuracy || 0}% avg
+                      {[
+                        { id: 'story-grammar', name: 'Story Grammar', icon: 'book-outline', color: '#7C3AED' },
+                        { id: 'mathematics', name: 'Mathematics', icon: 'shapes-outline', color: '#2563EB' },
+                        { id: 'technology-and-livelihood-education', name: 'TLE (ICT)', icon: 'videocam-outline', color: '#D97706' },
+                        { id: 'araling-panlipunan', name: 'Araling Panlipunan', icon: 'globe-outline', color: '#059669' },
+                      ].map((top) => (
+                        <View key={top.id} style={styles.topicPerfCard}>
+                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                            <Ionicons name={top.icon as any} size={20} color={top.color} />
+                            <Text style={styles.topicPerfTitle}>{top.name}</Text>
+                          </View>
+                          <Text style={styles.topicPerfStats}>
+                            {analyticsData.topic_stats?.[top.id]?.attempts || 0} attempts •{' '}
+                            <Text style={{ fontWeight: 'bold', color: top.color }}>
+                              {analyticsData.topic_stats?.[top.id]?.avg_accuracy || 0}% avg
+                            </Text>
                           </Text>
-                        </Text>
-                      </View>
-
-                      <View style={styles.topicPerfCard}>
-                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                          <Ionicons name="reader-outline" size={20} color="#0284C7" />
-                          <Text style={styles.topicPerfTitle}>English Literacy</Text>
                         </View>
-                        <Text style={styles.topicPerfStats}>
-                          {analyticsData.topic_stats?.['english-literacy']?.attempts || 0} attempts •{' '}
-                          <Text style={{ fontWeight: 'bold', color: '#0284C7' }}>
-                            {analyticsData.topic_stats?.['english-literacy']?.avg_accuracy || 0}% avg
-                          </Text>
-                        </Text>
-                      </View>
+                      ))}
                     </View>
                   </View>
 
@@ -1182,6 +1407,144 @@ export default function AdminScreen() {
                       <ActivityIndicator color="white" />
                     ) : (
                       <Text style={styles.submitBtnText}>Save Slides & Images</Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
+              )}
+            </ScrollView>
+          </SafeAreaView>
+        </Modal>
+      )}
+
+      {/* Edit Quiz Questions Modal */}
+      {editingQuiz && (
+        <Modal
+          animationType="slide"
+          transparent={false}
+          visible={!!editingQuiz}
+          onRequestClose={() => setEditingQuiz(null)}
+        >
+          <SafeAreaView style={{ flex: 1, backgroundColor: '#F8F9FA' }}>
+            <View style={styles.header}>
+              <TouchableOpacity style={styles.backButton} onPress={() => setEditingQuiz(null)}>
+                <Ionicons name="close" size={24} color="#0284C7" />
+              </TouchableOpacity>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.headerTitle} numberOfLines={1}>Edit Questions & Images</Text>
+                <Text style={{ fontSize: 12, color: '#6B7280' }}>
+                  {editingQuiz.title} • {editingQuiz.difficulty.toUpperCase()}
+                </Text>
+              </View>
+            </View>
+
+            <ScrollView contentContainerStyle={{ padding: 20, paddingBottom: 60 }}>
+              {loadingEditingQuiz ? (
+                <ActivityIndicator size="large" color="#0284C7" style={{ marginTop: 40 }} />
+              ) : (
+                <View style={styles.card}>
+                  <Text style={styles.cardTitle}>Quiz Questions Pool</Text>
+                  <Text style={{ fontSize: 13, color: '#6B7280', marginBottom: 16 }}>
+                    Edit question prompts, correct answers, hints, and question illustrations.
+                  </Text>
+
+                  {editingQuizQuestions.map((q, idx) => (
+                    <View key={idx} style={styles.slideCard}>
+                      <View style={styles.slideHeader}>
+                        <Text style={styles.slideNumber}>Question #{idx + 1}</Text>
+                        <TouchableOpacity onPress={() => handleRemoveQuizQuestion(idx)}>
+                          <Ionicons name="trash-outline" size={18} color="#EF4444" />
+                        </TouchableOpacity>
+                      </View>
+
+                      <Text style={styles.label}>Question Prompt:</Text>
+                      <TextInput
+                        style={styles.input}
+                        placeholder="Question prompt text..."
+                        value={q.question_text}
+                        onChangeText={(txt) => handleEditQuizQuestionText(txt, idx)}
+                      />
+
+                      {/* Question Image */}
+                      <Text style={styles.label}>Question Illustration / Visual (Optional):</Text>
+                      {q.image_url ? (
+                        <View style={styles.imagePreviewContainer}>
+                          <Image
+                            source={{ uri: q.image_url.startsWith('http') ? q.image_url : `${API_URL}${q.image_url}` }}
+                            style={styles.slideImagePreview}
+                            resizeMode="cover"
+                          />
+                          <View style={{ flexDirection: 'row', gap: 10 }}>
+                            <TouchableOpacity
+                              style={styles.changeImgBtn}
+                              onPress={() => pickQuizQuestionImage(idx)}
+                            >
+                              <Text style={styles.changeImgBtnText}>Change Image</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity
+                              style={[styles.changeImgBtn, { backgroundColor: '#FEE2E2' }]}
+                              onPress={() => handleRemoveQuizQuestionImage(idx)}
+                            >
+                              <Text style={[styles.changeImgBtnText, { color: '#EF4444' }]}>Remove</Text>
+                            </TouchableOpacity>
+                          </View>
+                        </View>
+                      ) : (
+                        <TouchableOpacity
+                          style={styles.uploadBtn}
+                          onPress={() => pickQuizQuestionImage(idx)}
+                        >
+                          <Ionicons name="image-outline" size={20} color="#0284C7" />
+                          <Text style={styles.uploadBtnText}>Upload / Choose Image</Text>
+                        </TouchableOpacity>
+                      )}
+
+                      {/* Hint */}
+                      <Text style={[styles.label, { marginTop: 10 }]}>Hint (Optional):</Text>
+                      <TextInput
+                        style={styles.input}
+                        placeholder="Hint text for 5-star student unlock..."
+                        value={q.hint}
+                        onChangeText={(txt) => handleEditQuizHint(txt, idx)}
+                      />
+
+                      {/* Options & Radio */}
+                      <Text style={styles.label}>Answer Options (Select correct answer):</Text>
+                      {q.options.map((opt: string, oIdx: number) => (
+                        <View key={oIdx} style={styles.optionRow}>
+                          <TouchableOpacity
+                            style={[styles.radio, q.correct_option_index === oIdx && styles.radioActive]}
+                            onPress={() => handleSetCorrectOption(idx, oIdx)}
+                          >
+                            {q.correct_option_index === oIdx && <View style={styles.radioInner} />}
+                          </TouchableOpacity>
+                          <TextInput
+                            style={[styles.input, { flex: 1, marginBottom: 0 }]}
+                            placeholder={`Option ${String.fromCharCode(65 + oIdx)}`}
+                            value={opt}
+                            onChangeText={(txt) => handleEditQuizOption(txt, idx, oIdx)}
+                          />
+                        </View>
+                      ))}
+                    </View>
+                  ))}
+
+                  <TouchableOpacity
+                    style={styles.addSlideBtn}
+                    onPress={handleAddQuizQuestion}
+                  >
+                    <Ionicons name="add-circle-outline" size={20} color="#0284C7" />
+                    <Text style={styles.addSlideBtnText}>Add Another Question</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[styles.submitBtn, savingEditingQuiz && styles.submitBtnDisabled]}
+                    onPress={handleSaveQuizQuestions}
+                    disabled={savingEditingQuiz}
+                  >
+                    {savingEditingQuiz ? (
+                      <ActivityIndicator color="white" />
+                    ) : (
+                      <Text style={styles.submitBtnText}>Save Questions & Images</Text>
                     )}
                   </TouchableOpacity>
                 </View>

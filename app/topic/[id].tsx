@@ -1,7 +1,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import { router, useLocalSearchParams } from "expo-router";
-import React, { useEffect, useState } from 'react';
-import { SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, View, ActivityIndicator } from "react-native";
+import React, { useEffect, useState, useRef } from 'react';
+import { SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, View, ActivityIndicator, Animated, Platform } from "react-native";
 import { useSubjects } from "../../context/SubjectsContext";
 import { useAuth } from "../../context/AuthContext";
 import { API_URL } from "../../context/config";
@@ -50,6 +50,28 @@ export default function TopicScreen() {
   const [lessonGroups, setLessonGroups] = useState<LessonGroup[]>([]);
   const [studentProgress, setStudentProgress] = useState<Record<number, LessonProgress>>({});
   const [loading, setLoading] = useState(true);
+
+  // Subtle "Active Lesson" Breathing Pulse (Visual Signifier for DHH Learners)
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    const pulse = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulseAnim, {
+          toValue: 1.025,
+          duration: 1200,
+          useNativeDriver: Platform.OS !== 'web',
+        }),
+        Animated.timing(pulseAnim, {
+          toValue: 1,
+          duration: 1200,
+          useNativeDriver: Platform.OS !== 'web',
+        }),
+      ])
+    );
+    pulse.start();
+    return () => pulse.stop();
+  }, [pulseAnim]);
 
   const fetchData = async () => {
     try {
@@ -146,53 +168,60 @@ export default function TopicScreen() {
             const isNextUp = unlocked && !isCompleted;
 
             return (
-              <TouchableOpacity
+              <Animated.View
                 key={group.id}
                 style={[
-                  styles.questCard,
-                  !unlocked && styles.questCardLocked,
-                  isNextUp && styles.questCardActive,
+                  { width: '100%' },
+                  isNextUp ? { transform: [{ scale: pulseAnim }] } : null,
                 ]}
-                disabled={!unlocked}
-                onPress={() => {
-                  router.push(`/difficulty/${group.id}?subjectId=${subjectId}&deafEnglish=${isDeafEnglish}&topicId=${id}` as any);
-                }}
               >
-                <View style={styles.questHeader}>
-                  <View style={[
-                    styles.questIconContainer,
-                    unlocked ? { backgroundColor: "#E0F2FE" } : { backgroundColor: "#F3F4F6" }
-                  ]}>
-                    <Ionicons
-                      name={!unlocked ? "lock-closed-outline" : isCompleted ? "checkmark-circle-outline" : "bulb-outline"}
-                      size={28}
-                      color={!unlocked ? "#9CA3AF" : isCompleted ? "#10B981" : "#0284C7"}
-                    />
-                  </View>
+                <TouchableOpacity
+                  style={[
+                    styles.questCard,
+                    !unlocked && styles.questCardLocked,
+                    isNextUp && styles.questCardActive,
+                  ]}
+                  disabled={!unlocked}
+                  onPress={() => {
+                    router.push(`/difficulty/${group.id}?subjectId=${subjectId}&deafEnglish=${isDeafEnglish}&topicId=${id}` as any);
+                  }}
+                >
+                  <View style={styles.questHeader}>
+                    <View style={[
+                      styles.questIconContainer,
+                      unlocked ? { backgroundColor: "#E0F2FE" } : { backgroundColor: "#F3F4F6" }
+                    ]}>
+                      <Ionicons
+                        name={!unlocked ? "lock-closed-outline" : isCompleted ? "checkmark-circle-outline" : "bulb-outline"}
+                        size={28}
+                        color={!unlocked ? "#9CA3AF" : isCompleted ? "#10B981" : "#0284C7"}
+                      />
+                    </View>
 
-                  <View style={styles.questInfo}>
-                    <Text style={[styles.questTitle, !unlocked && { color: "#9CA3AF" }]}>
-                      {isDeafEnglish ? group.title.toUpperCase() : group.title}
-                    </Text>
-                    <Text style={styles.questSubtitle}>
-                      {!unlocked
-                        ? `🔒 Complete Lesson ${index} Easy quiz to unlock`
-                        : isCompleted
-                        ? `✅ Passed • Best Score: ${prog?.easy_best_score || 0}%`
-                        : "⭐ Current Lesson — Tap to start"}
-                    </Text>
-                  </View>
+                    <View style={styles.questInfo}>
+                      <Text style={[styles.questTitle, !unlocked && { color: "#9CA3AF" }]}>
+                        {isDeafEnglish ? group.title.toUpperCase() : group.title}
+                      </Text>
+                      <Text style={styles.questSubtitle}>
+                        {!unlocked
+                          ? `Complete Lesson ${index} Easy quiz to unlock`
+                          : isCompleted
+                          ? `Passed • Best Score: ${prog?.easy_best_score || 0}%`
+                          : "Current Lesson — Tap to start"}
+                      </Text>
+                    </View>
 
-                  <View style={[
-                    styles.badge,
-                    unlocked ? (isCompleted ? { backgroundColor: "#10B981" } : { backgroundColor: "#0284C7" }) : { backgroundColor: "#9CA3AF" }
-                  ]}>
-                    <Text style={styles.badgeText}>
-                      {!unlocked ? "Locked" : isCompleted ? "Passed" : "Active"}
-                    </Text>
+                    <View style={[
+                      styles.badge,
+                      unlocked ? (isCompleted ? { backgroundColor: "#10B981" } : { backgroundColor: "#0284C7" }) : { backgroundColor: "#9CA3AF" }
+                    ]}>
+                      <Text style={styles.badgeText}>
+                        {!unlocked ? "Locked" : isCompleted ? "Passed" : "Active"}
+                      </Text>
+                    </View>
                   </View>
-                </View>
-              </TouchableOpacity>
+                </TouchableOpacity>
+              </Animated.View>
             );
           })
         )}
@@ -214,7 +243,15 @@ const styles = StyleSheet.create({
   scrollViewContent: { padding: 20, paddingBottom: 40 },
   questCard: { backgroundColor: "white", borderRadius: 16, padding: 18, marginBottom: 16, borderWidth: 1, borderColor: "#E0F2FE", shadowColor: "#000", shadowOffset: { width: 0, height: 2 }, shadowOpacity: 0.05, shadowRadius: 10, elevation: 2 },
   questCardLocked: { backgroundColor: "#F9FAFB", borderColor: "#E5E7EB", opacity: 0.75 },
-  questCardActive: { borderColor: "#0284C7", borderWidth: 2 },
+  questCardActive: {
+    borderColor: "#0284C7",
+    borderWidth: 2,
+    shadowColor: "#0284C7",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.2,
+    shadowRadius: 8,
+    elevation: 4,
+  },
   questHeader: { flexDirection: "row", alignItems: "center" },
   questIconContainer: { width: 56, height: 56, borderRadius: 16, justifyContent: "center", alignItems: "center", marginRight: 16 },
   questInfo: { flex: 1, justifyContent: "center" },

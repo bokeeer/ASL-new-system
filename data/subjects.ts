@@ -391,10 +391,10 @@ export const subjectsData: Record<string, Subject> = {
   },
   english: {
     id: 'english',
-    name: 'English',
+    name: 'Core Curriculum',
     categories: [
       {
-        name: 'English Modules',
+        name: 'Core Learning Modules',
         topics: [
           {
             id: 'story-grammar',
@@ -412,17 +412,47 @@ export const subjectsData: Record<string, Subject> = {
             }
           },
           {
-            id: 'english-literacy',
-            name: 'English Literacy',
-            description: 'Enhance reading comprehension, vocabulary, and sentence structures.',
+            id: 'mathematics',
+            name: 'Mathematics',
+            description: 'Measurement & Geometry: Draw resulting images of shapes that undergo translation, reflection, and rotation.',
             progress: 0,
-            icon: 'reader-outline',
-            iconColor: '#0284C7',
-            bgColor: '#E0F2FE',
+            icon: 'shapes-outline',
+            iconColor: '#2563EB',
+            bgColor: '#DBEAFE',
             starsEarned: 0,
             lessons: [],
             quiz: {
-              id: 'quiz_english_literacy',
+              id: 'quiz_mathematics',
+              questions: []
+            }
+          },
+          {
+            id: 'technology-and-livelihood-education',
+            name: 'Technology and Livelihood Education',
+            description: 'ICT: Perform web conferencing in a safe and responsible manner.',
+            progress: 0,
+            icon: 'videocam-outline',
+            iconColor: '#D97706',
+            bgColor: '#FEF3C7',
+            starsEarned: 0,
+            lessons: [],
+            quiz: {
+              id: 'quiz_tle',
+              questions: []
+            }
+          },
+          {
+            id: 'araling-panlipunan',
+            name: 'Araling Panlipunan',
+            description: 'The Story of the Katipunan (KKK): Founding, objectives, teachings (Kartilya), and spread.',
+            progress: 0,
+            icon: 'globe-outline',
+            iconColor: '#059669',
+            bgColor: '#D1FAE5',
+            starsEarned: 0,
+            lessons: [],
+            quiz: {
+              id: 'quiz_araling_panlipunan',
               questions: []
             }
           }

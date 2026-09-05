@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   View,
   Text,
@@ -8,11 +8,13 @@ import {
   TouchableOpacity,
   ActivityIndicator,
   Platform,
+  Animated,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useAuth } from '../context/AuthContext';
 import { API_URL } from '../context/config';
+import Confetti from '../components/Confetti';
 
 // --- Types -------------------------------------------------------------------
 
@@ -64,6 +66,38 @@ export default function DailyQuizScreen() {
   const [loading, setLoading] = useState(true);
   const [repairingStreak, setRepairingStreak] = useState(false);
   const [refreshingSlot, setRefreshingSlot] = useState<string | null>(null);
+
+  // Subtle Flame Flicker / Pulse for active study streak
+  const flameAnim = useRef(new Animated.Value(1)).current;
+
+  useEffect(() => {
+    const flameLoop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(flameAnim, {
+          toValue: 1.16,
+          duration: 750,
+          useNativeDriver: Platform.OS !== 'web',
+        }),
+        Animated.timing(flameAnim, {
+          toValue: 0.96,
+          duration: 600,
+          useNativeDriver: Platform.OS !== 'web',
+        }),
+        Animated.timing(flameAnim, {
+          toValue: 1.10,
+          duration: 650,
+          useNativeDriver: Platform.OS !== 'web',
+        }),
+        Animated.timing(flameAnim, {
+          toValue: 1.0,
+          duration: 700,
+          useNativeDriver: Platform.OS !== 'web',
+        }),
+      ])
+    );
+    flameLoop.start();
+    return () => flameLoop.stop();
+  }, [flameAnim]);
 
   // -- Fetch helpers ----------------------------------------------------------
 
@@ -148,6 +182,7 @@ export default function DailyQuizScreen() {
 
   return (
     <SafeAreaView style={styles.safe}>
+      {fullClear && <Confetti count={50} />}
       {/* Header */}
       <View style={styles.header}>
         <TouchableOpacity style={styles.backBtn} onPress={() => router.back()}>
@@ -179,7 +214,9 @@ export default function DailyQuizScreen() {
           {streak && (
             <View style={styles.streakCard}>
               <View style={styles.streakLeft}>
-                <Ionicons name="flame" size={32} color="#F97316" />
+                <Animated.View style={!streak.streak_broken ? { transform: [{ scale: flameAnim }] } : null}>
+                  <Ionicons name="flame" size={32} color={streak.streak_broken ? "#9CA3AF" : "#F97316"} />
+                </Animated.View>
                 <View style={{ marginLeft: 12 }}>
                   <Text style={styles.streakCount}>{streak.current_streak} day streak</Text>
                   <Text style={styles.streakSub}>

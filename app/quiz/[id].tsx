@@ -1,10 +1,12 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { View, Text, StyleSheet, ScrollView, SafeAreaView, TouchableOpacity, ActivityIndicator, Image, Dimensions, Modal, Alert } from "react-native";
+import { View, Text, StyleSheet, ScrollView, SafeAreaView, TouchableOpacity, ActivityIndicator, Image, Dimensions, Modal, Alert, Animated, Platform } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
+import * as Haptics from 'expo-haptics';
 import { useLocalSearchParams, router } from "expo-router";
 import { useSubjects } from "../../context/SubjectsContext";
 import { useAuth } from "../../context/AuthContext";
 import { API_URL } from "../../context/config";
+import Confetti from "../../components/Confetti";
 
 const { width } = Dimensions.get('window');
 
@@ -92,6 +94,35 @@ export default function QuizScreen() {
   const [hintUsed, setHintUsed] = useState(false);
   const [eliminatedOptionIdx, setEliminatedOptionIdx] = useState<number | null>(null);
 
+  // Visual Feedback Animations (Auditory-Free)
+  const shakeAnim = useRef(new Animated.Value(0)).current;
+  const starPopAnim = useRef(new Animated.Value(0)).current;
+  const hintElimAnim = useRef(new Animated.Value(0)).current;
+  const [showStarPop, setShowStarPop] = useState(false);
+
+  const triggerShake = () => {
+    shakeAnim.setValue(0);
+    Animated.sequence([
+      Animated.timing(shakeAnim, { toValue: -8, duration: 45, useNativeDriver: Platform.OS !== 'web' }),
+      Animated.timing(shakeAnim, { toValue: 8, duration: 45, useNativeDriver: Platform.OS !== 'web' }),
+      Animated.timing(shakeAnim, { toValue: -6, duration: 45, useNativeDriver: Platform.OS !== 'web' }),
+      Animated.timing(shakeAnim, { toValue: 6, duration: 45, useNativeDriver: Platform.OS !== 'web' }),
+      Animated.timing(shakeAnim, { toValue: 0, duration: 45, useNativeDriver: Platform.OS !== 'web' }),
+    ]).start();
+  };
+
+  const triggerStarPop = () => {
+    setShowStarPop(true);
+    starPopAnim.setValue(0);
+    Animated.timing(starPopAnim, {
+      toValue: 1,
+      duration: 800,
+      useNativeDriver: Platform.OS !== 'web',
+    }).start(() => {
+      setShowStarPop(false);
+    });
+  };
+
   const handleUseHint = async () => {
     if (!attemptId) {
       Alert.alert('Not available', 'Quiz session is not started yet.');
@@ -124,6 +155,15 @@ export default function QuizScreen() {
         if (wrongIndices.length > 0) {
           const randomWrong = wrongIndices[Math.floor(Math.random() * wrongIndices.length)];
           setEliminatedOptionIdx(randomWrong);
+          hintElimAnim.setValue(0);
+          Animated.timing(hintElimAnim, {
+            toValue: 1,
+            duration: 450,
+            useNativeDriver: false,
+          }).start();
+          try {
+            Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
+          } catch {}
         }
       }
     } catch {
@@ -277,6 +317,8 @@ export default function QuizScreen() {
       // Reset hint per question
       setHintText(null);
       setHintUsed(false);
+      setEliminatedOptionIdx(null);
+      hintElimAnim.setValue(0);
     }
   }, [currentQuestionIndex, quizQuestions]);
 
@@ -325,6 +367,15 @@ export default function QuizScreen() {
     if (isCorrect) {
       newScore = score + 1;
       setScore(newScore);
+      triggerStarPop();
+      try {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      } catch {}
+    } else {
+      triggerShake();
+      try {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error).catch(() => {});
+      } catch {}
     }
 
     const newAnswer: QuestionAnswerRecord = {
@@ -337,6 +388,9 @@ export default function QuizScreen() {
 
     // Auto-advance after 1.2 seconds
     setTimeout(() => {
+      setShowStarPop(false);
+      shakeAnim.setValue(0);
+      starPopAnim.setValue(0);
       if (currentQuestionIndex < quizQuestions.length - 1) {
         setCurrentQuestionIndex(prev => prev + 1);
         setSelectedOptionIndex(null);
@@ -357,12 +411,19 @@ export default function QuizScreen() {
 
     if (pairFound) {
       setMatchingFeedback('correct');
+      triggerStarPop();
+      try {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      } catch {}
       const updatedPairs = [...currentMatchedPairs, { left, right }];
       setCurrentMatchedPairs(updatedPairs);
       setSelectedLeft(null);
       setSelectedRight(null);
 
-      setTimeout(() => setMatchingFeedback(null), 800);
+      setTimeout(() => {
+        setMatchingFeedback(null);
+        setShowStarPop(false);
+      }, 800);
 
       // Check if all pairs are matched
       if (updatedPairs.length === currentQuestion.matching_pairs.length) {
@@ -392,6 +453,10 @@ export default function QuizScreen() {
       }
     } else {
       setMatchingFeedback('wrong');
+      triggerShake();
+      try {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error).catch(() => {});
+      } catch {}
       setTimeout(() => {
         setMatchingFeedback(null);
         setSelectedLeft(null);
@@ -447,6 +512,7 @@ export default function QuizScreen() {
 
     return (
       <SafeAreaView style={styles.safeArea}>
+        {passed && <Confetti count={65} />}
         <View style={styles.finishedContainer}>
           <Ionicons
             name={passed ? "trophy" : "refresh-circle"}
@@ -455,7 +521,7 @@ export default function QuizScreen() {
           />
 
           <Text style={styles.finishedTitle}>
-            {passed ? "🎉 Quiz Passed!" : "Keep Trying!"}
+            {passed ? "Quiz Passed!" : "Keep Trying!"}
           </Text>
 
           <Text style={styles.finishedScore}>
@@ -469,17 +535,20 @@ export default function QuizScreen() {
           {/* Celebration Unlocks */}
           {completionResult?.unlocked_medium && (
             <View style={styles.unlockCelebrationBox}>
-              <Text style={styles.unlockCelebrationText}>🎉 🟡 Medium Lesson UNLOCKED!</Text>
+              <Ionicons name="sparkles" size={16} color="#854D0E" style={{ marginRight: 6 }} />
+              <Text style={styles.unlockCelebrationText}>Medium Tier Unlocked!</Text>
             </View>
           )}
           {completionResult?.unlocked_hard && (
             <View style={styles.unlockCelebrationBox}>
-              <Text style={styles.unlockCelebrationText}>🎉 🔴 Hard Lesson UNLOCKED!</Text>
+              <Ionicons name="trophy" size={16} color="#854D0E" style={{ marginRight: 6 }} />
+              <Text style={styles.unlockCelebrationText}>Hard Tier Unlocked!</Text>
             </View>
           )}
           {completionResult?.unlocked_next_lesson && (
             <View style={styles.unlockCelebrationBox}>
-              <Text style={styles.unlockCelebrationText}>🎉 Next Lesson UNLOCKED!</Text>
+              <Ionicons name="checkmark-done" size={16} color="#854D0E" style={{ marginRight: 6 }} />
+              <Text style={styles.unlockCelebrationText}>Next Lesson Unlocked!</Text>
             </View>
           )}
 
@@ -554,7 +623,7 @@ export default function QuizScreen() {
             <>
               <Ionicons name="bulb-outline" size={16} color={hintUsed ? "#9CA3AF" : "#7C3AED"} />
               <Text style={[styles.hintHeaderBtnText, hintUsed && styles.hintHeaderBtnTextUsed]}>
-                {hintUsed ? "Hint Used" : "Hint (-5★)"}
+                {hintUsed ? "Hint Used" : "Hint (-5 Stars)"}
               </Text>
             </>
           )}
@@ -604,21 +673,83 @@ export default function QuizScreen() {
                 }
 
                 return (
-                  <TouchableOpacity
+                  <Animated.View
                     key={idx}
-                    style={optionStyle}
-                    disabled={isAnswered || isEliminated}
-                    onPress={() => handleSelectOption(idx)}
+                    style={[
+                      { width: '100%', position: 'relative' },
+                      isSelected && !isCorrect ? { transform: [{ translateX: shakeAnim }] } : null,
+                      isEliminated
+                        ? {
+                            opacity: hintElimAnim.interpolate({
+                              inputRange: [0, 1],
+                              outputRange: [1, 0.45],
+                            }),
+                          }
+                        : null,
+                    ]}
                   >
-                    <View style={styles.optionLetterBox}>
-                      <Text style={[styles.optionLetter, isEliminated && { color: '#9CA3AF' }]}>
-                        {isEliminated ? '✕' : option.id}
+                    <TouchableOpacity
+                      style={optionStyle}
+                      disabled={isAnswered || isEliminated}
+                      onPress={() => handleSelectOption(idx)}
+                    >
+                      <View style={styles.optionLetterBox}>
+                        <Text style={[styles.optionLetter, isEliminated && { color: '#9CA3AF' }]}>
+                          {isEliminated ? '✕' : option.id}
+                        </Text>
+                      </View>
+                      <Text style={[styles.optionText, isEliminated && styles.optionTextEliminated]}>
+                        {isDeafEnglish ? option.deafText : option.text}
                       </Text>
-                    </View>
-                    <Text style={[styles.optionText, isEliminated && styles.optionTextEliminated]}>
-                      {isDeafEnglish ? option.deafText : option.text}
-                    </Text>
-                  </TouchableOpacity>
+
+                      {/* Animated Distractor Strikethrough Line */}
+                      {isEliminated && (
+                        <Animated.View
+                          style={[
+                            styles.strikethroughLine,
+                            {
+                              width: hintElimAnim.interpolate({
+                                inputRange: [0, 1],
+                                outputRange: ['0%', '78%'],
+                              }),
+                            },
+                          ]}
+                        />
+                      )}
+
+                      {/* Floating +10 Stars Pop Animation */}
+                      {isAnswered && isCorrect && showStarPop && (
+                        <Animated.View
+                          style={[
+                            styles.starPopBadge,
+                            {
+                              opacity: starPopAnim.interpolate({
+                                inputRange: [0, 0.7, 1],
+                                outputRange: [1, 1, 0],
+                              }),
+                              transform: [
+                                {
+                                  translateY: starPopAnim.interpolate({
+                                    inputRange: [0, 1],
+                                    outputRange: [0, -38],
+                                  }),
+                                },
+                                {
+                                  scale: starPopAnim.interpolate({
+                                    inputRange: [0, 0.25, 1],
+                                    outputRange: [0.5, 1.15, 0.95],
+                                  }),
+                                },
+                              ],
+                            },
+                          ]}
+                        >
+                          <Ionicons name="star" size={15} color="#F59E0B" />
+                          <Text style={styles.starPopText}>+10 Stars</Text>
+                        </Animated.View>
+                      )}
+                    </TouchableOpacity>
+                  </Animated.View>
                 );
               })}
             </View>
@@ -626,60 +757,99 @@ export default function QuizScreen() {
 
           {/* Matching Pairs UI */}
           {currentQuestion.question_type === 'matching' && (
-            <View style={styles.matchingContainer}>
-              <View style={styles.matchingColumn}>
-                <Text style={styles.matchingColHeader}>Items</Text>
-                {shuffledLeftItems.map((item, idx) => {
-                  const isMatched = currentMatchedPairs.some(p => p.left === item);
-                  const isSelected = selectedLeft === item;
-                  return (
-                    <TouchableOpacity
-                      key={idx}
-                      style={[
-                        styles.matchingChip,
-                        isSelected && styles.matchingChipSelected,
-                        isMatched && styles.matchingChipMatched,
-                      ]}
-                      disabled={isMatched}
-                      onPress={() => {
-                        setSelectedLeft(item);
-                        if (selectedRight) handlePairMatch(item, selectedRight);
-                      }}
-                    >
-                      <Text style={[styles.matchingChipText, isMatched && styles.matchingChipTextMatched]}>
-                        {isDeafEnglish ? item.toUpperCase() : item}
-                      </Text>
-                    </TouchableOpacity>
-                  );
-                })}
-              </View>
+            <View>
+              {/* Matching Feedback Star Pop */}
+              {matchingFeedback === 'correct' && showStarPop && (
+                <Animated.View
+                  style={[
+                    styles.matchingStarPopBadge,
+                    {
+                      opacity: starPopAnim.interpolate({
+                        inputRange: [0, 0.7, 1],
+                        outputRange: [1, 1, 0],
+                      }),
+                      transform: [
+                        {
+                          translateY: starPopAnim.interpolate({
+                            inputRange: [0, 1],
+                            outputRange: [0, -25],
+                          }),
+                        },
+                        {
+                          scale: starPopAnim.interpolate({
+                            inputRange: [0, 0.25, 1],
+                            outputRange: [0.6, 1.2, 1],
+                          }),
+                        },
+                      ],
+                    },
+                  ]}
+                >
+                  <Ionicons name="star" size={16} color="#F59E0B" />
+                  <Text style={styles.starPopText}>+10 Stars Matched!</Text>
+                </Animated.View>
+              )}
 
-              <View style={styles.matchingColumn}>
-                <Text style={styles.matchingColHeader}>Matches</Text>
-                {shuffledRightItems.map((item, idx) => {
-                  const isMatched = currentMatchedPairs.some(p => p.right === item);
-                  const isSelected = selectedRight === item;
-                  return (
-                    <TouchableOpacity
-                      key={idx}
-                      style={[
-                        styles.matchingChip,
-                        isSelected && styles.matchingChipSelected,
-                        isMatched && styles.matchingChipMatched,
-                      ]}
-                      disabled={isMatched}
-                      onPress={() => {
-                        setSelectedRight(item);
-                        if (selectedLeft) handlePairMatch(selectedLeft, item);
-                      }}
-                    >
-                      <Text style={[styles.matchingChipText, isMatched && styles.matchingChipTextMatched]}>
-                        {isDeafEnglish ? item.toUpperCase() : item}
-                      </Text>
-                    </TouchableOpacity>
-                  );
-                })}
-              </View>
+              <Animated.View
+                style={[
+                  styles.matchingContainer,
+                  matchingFeedback === 'wrong' ? { transform: [{ translateX: shakeAnim }] } : null,
+                ]}
+              >
+                <View style={styles.matchingColumn}>
+                  <Text style={styles.matchingColHeader}>Items</Text>
+                  {shuffledLeftItems.map((item, idx) => {
+                    const isMatched = currentMatchedPairs.some(p => p.left === item);
+                    const isSelected = selectedLeft === item;
+                    return (
+                      <TouchableOpacity
+                        key={idx}
+                        style={[
+                          styles.matchingChip,
+                          isSelected && styles.matchingChipSelected,
+                          isMatched && styles.matchingChipMatched,
+                        ]}
+                        disabled={isMatched}
+                        onPress={() => {
+                          setSelectedLeft(item);
+                          if (selectedRight) handlePairMatch(item, selectedRight);
+                        }}
+                      >
+                        <Text style={[styles.matchingChipText, isMatched && styles.matchingChipTextMatched]}>
+                          {isDeafEnglish ? item.toUpperCase() : item}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+
+                <View style={styles.matchingColumn}>
+                  <Text style={styles.matchingColHeader}>Matches</Text>
+                  {shuffledRightItems.map((item, idx) => {
+                    const isMatched = currentMatchedPairs.some(p => p.right === item);
+                    const isSelected = selectedRight === item;
+                    return (
+                      <TouchableOpacity
+                        key={idx}
+                        style={[
+                          styles.matchingChip,
+                          isSelected && styles.matchingChipSelected,
+                          isMatched && styles.matchingChipMatched,
+                        ]}
+                        disabled={isMatched}
+                        onPress={() => {
+                          setSelectedRight(item);
+                          if (selectedLeft) handlePairMatch(selectedLeft, item);
+                        }}
+                      >
+                        <Text style={[styles.matchingChipText, isMatched && styles.matchingChipTextMatched]}>
+                          {isDeafEnglish ? item.toUpperCase() : item}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              </Animated.View>
             </View>
           )}
         </View>
@@ -796,7 +966,7 @@ const styles = StyleSheet.create({
   finishedTitle: { fontSize: 24, fontWeight: 'bold', color: '#1F2937', marginTop: 16 },
   finishedScore: { fontSize: 20, color: '#0284C7', fontWeight: 'bold', marginTop: 8 },
   difficultyBadge: { fontSize: 14, color: '#6B7280', marginTop: 4, textTransform: 'uppercase', fontWeight: '600' },
-  unlockCelebrationBox: { backgroundColor: '#FEF08A', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 12, marginTop: 14 },
+  unlockCelebrationBox: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#FEF08A', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 12, marginTop: 14 },
   unlockCelebrationText: { color: '#854D0E', fontWeight: 'bold', fontSize: 15 },
   finishedActions: { width: '100%', gap: 12, marginTop: 30 },
   retryBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, paddingVertical: 14, borderRadius: 12, borderWidth: 2, borderColor: '#0284C7', backgroundColor: 'white' },
@@ -822,9 +992,61 @@ const styles = StyleSheet.create({
   aslResultLabel: { fontSize: 11, color: '#7C3AED', fontWeight: '600', marginBottom: 4 },
   optionEliminated: { opacity: 0.45, backgroundColor: '#F3F4F6', borderColor: '#D1D5DB' },
   optionTextEliminated: { textDecorationLine: 'line-through', color: '#9CA3AF' },
+  strikethroughLine: {
+    position: 'absolute',
+    left: 56,
+    height: 3,
+    backgroundColor: '#EF4444',
+    borderRadius: 2,
+    top: '50%',
+    zIndex: 10,
+  },
   progressBarBg: { height: 6, backgroundColor: '#E5E7EB', width: '100%' },
   progressBarFill: { height: '100%', backgroundColor: '#7C3AED' },
   headerSub: { fontSize: 12, color: '#6B7280', marginTop: 2 },
   doneButton: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#7C3AED', paddingVertical: 12, paddingHorizontal: 24, borderRadius: 12, marginTop: 20 },
   doneButtonText: { color: 'white', fontSize: 16, fontWeight: 'bold', marginRight: 8 },
+  starPopBadge: {
+    position: 'absolute',
+    right: 12,
+    top: -10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: '#FEF3C7',
+    borderWidth: 1.5,
+    borderColor: '#F59E0B',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+    shadowColor: '#F59E0B',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+    elevation: 6,
+    zIndex: 20,
+  },
+  starPopText: {
+    fontSize: 12,
+    fontWeight: 'bold',
+    color: '#92400E',
+  },
+  matchingStarPopBadge: {
+    alignSelf: 'center',
+    marginBottom: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#FEF3C7',
+    borderWidth: 1.5,
+    borderColor: '#F59E0B',
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 16,
+    shadowColor: '#F59E0B',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+    elevation: 6,
+  },
 });
