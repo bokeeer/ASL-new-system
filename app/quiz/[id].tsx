@@ -7,6 +7,11 @@ import { useSubjects } from "../../context/SubjectsContext";
 import { useAuth } from "../../context/AuthContext";
 import { API_URL } from "../../context/config";
 import Confetti from "../../components/Confetti";
+import {
+  cacheQuizSession,
+  getCachedQuizSession,
+  enqueuePendingQuiz,
+} from "../../context/OfflineCache";
 
 const { width } = Dimensions.get('window');
 
@@ -17,7 +22,7 @@ interface MatchPair {
 
 interface QuestionAnswerRecord {
   question_id: number;
-  is_correct: bool;
+  is_correct: boolean;
   time_spent_seconds: number;
 }
 
@@ -56,6 +61,7 @@ export default function QuizScreen() {
   const [loading, setLoading] = useState(true);
   const [lockedError, setLockedError] = useState<string | null>(null);
   const [attemptCount, setAttemptCount] = useState(1);
+  const [isOfflineSaved, setIsOfflineSaved] = useState(false);
 
   // Answer tracking for backend submission
   const [answersRecord, setAnswersRecord] = useState<QuestionAnswerRecord[]>([]);
@@ -150,8 +156,8 @@ export default function QuizScreen() {
       // Visual elimination of 1 wrong choice for multiple choice
       if (currentQ && currentQ.question_type !== 'matching' && currentQ.options && currentQ.options.length > 2) {
         const wrongIndices = currentQ.options
-          .map((_, i) => i)
-          .filter(i => i !== currentQ.correctOptionIndex);
+          .map((_: any, i: number) => i)
+          .filter((i: number) => i !== currentQ.correctOptionIndex);
         if (wrongIndices.length > 0) {
           const randomWrong = wrongIndices[Math.floor(Math.random() * wrongIndices.length)];
           setEliminatedOptionIdx(randomWrong);
@@ -225,6 +231,7 @@ export default function QuizScreen() {
     setCurrentQuestionIndex(0);
     setAnswersRecord([]);
     setCompletionResult(null);
+    setIsOfflineSaved(false);
     totalQuizStartTimeRef.current = Date.now();
 
     try {
@@ -264,6 +271,9 @@ export default function QuizScreen() {
       setAttemptId(sessionData.attempt_id);
       setDifficulty(sessionData.difficulty || "easy");
 
+      // Cache session for offline reuse
+      await cacheQuizSession(targetQuizId as string, sessionData);
+
       const mapped = sessionData.questions.map((q: any) => ({
         id: q.id,
         question: q.question_text,
@@ -288,8 +298,54 @@ export default function QuizScreen() {
       setQuizTitle(`${difficulty.toUpperCase()} Quiz`);
       questionStartTimeRef.current = Date.now();
     } catch (err: any) {
-      console.log('Error starting quiz session:', err);
-      setLockedError(err.message || "Failed to load quiz.");
+      console.log('Error starting quiz session, checking cache (offline):', err);
+
+      // Offline fallback: load cached session or topic quiz
+      let loaded = false;
+      const targetQuizId = paramQuizId;
+      if (targetQuizId) {
+        const cachedSession = await getCachedQuizSession(targetQuizId as string);
+        if (cachedSession?.questions?.length) {
+          setAttemptId(cachedSession.attempt_id || null);
+          setDifficulty(cachedSession.difficulty || (paramDiff as string) || "easy");
+          const mapped = cachedSession.questions.map((q: any) => ({
+            id: q.id,
+            question: q.question_text,
+            deafQuestion: q.question_text.toUpperCase(),
+            question_type: q.question_type || 'descriptive',
+            image_url: q.image_url,
+            options: (q.options || []).map((opt: string, idx: number) => ({
+              id: String.fromCharCode(65 + idx),
+              text: opt,
+              deafText: opt.toUpperCase()
+            })),
+            correctOptionId: String.fromCharCode(65 + (q.correct_option_index ?? 0)),
+            matching_pairs: (q.matching_pairs || []).map((p: any) => ({
+              left: p.left || p.left_item || '',
+              right: p.right || p.right_item || ''
+            })),
+            hint: "Look closely at the choice text.",
+            deafHint: "LOOK CLOSELY AT THE CHOICE TEXT."
+          }));
+          setQuizQuestions(mapped);
+          setQuizTitle(`${(cachedSession.difficulty || 'QUIZ').toUpperCase()} Quiz (Offline)`);
+          questionStartTimeRef.current = Date.now();
+          setLockedError(null);
+          loaded = true;
+        }
+      }
+
+      if (!loaded && topic?.quiz?.questions?.length) {
+        setQuizQuestions(topic.quiz.questions);
+        setQuizTitle(`${topic.name} Quiz (Offline)`);
+        questionStartTimeRef.current = Date.now();
+        setLockedError(null);
+        loaded = true;
+      }
+
+      if (!loaded) {
+        setLockedError(err.message || "Failed to load quiz offline.");
+      }
     } finally {
       setLoading(false);
     }
@@ -326,28 +382,61 @@ export default function QuizScreen() {
 
   // Submit quiz results to backend when finished
   const submitQuizResults = async (finalScore: number, finalAnswers: QuestionAnswerRecord[]) => {
-    if (!attemptId) return;
     setSubmittingResults(true);
     const totalTimeSec = Math.round((Date.now() - totalQuizStartTimeRef.current) / 1000);
+    const totalQ = quizQuestions.length > 0 ? quizQuestions.length : 1;
+    const accuracyPct = Math.round((finalScore / totalQ) * 100);
+    const isPassed = accuracyPct >= 70;
+    const targetQuizId = Number(paramQuizId) || 1;
 
     try {
-      const res = await fetch(`${API_URL}/quiz/session/${attemptId}/complete`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          score: finalScore,
-          total_questions: quizQuestions.length,
-          time_spent_seconds: totalTimeSec,
-          answers: finalAnswers,
-        }),
+      if (attemptId) {
+        const res = await fetch(`${API_URL}/quiz/session/${attemptId}/complete`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            score: finalScore,
+            total_questions: totalQ,
+            time_spent_seconds: totalTimeSec,
+            answers: finalAnswers,
+          }),
+        });
+
+        if (res.ok) {
+          const result = await res.json();
+          setCompletionResult(result);
+          setIsOfflineSaved(false);
+          return;
+        }
+      }
+      throw new Error('Network offline or request failed');
+    } catch (err) {
+      console.log('Quiz submission offline, saving to pending queue:', err);
+      // Queue offline attempt for auto-sync
+      await enqueuePendingQuiz({
+        userId,
+        quizId: targetQuizId,
+        attemptId: attemptId || null,
+        difficulty: difficulty || 'easy',
+        score: finalScore,
+        totalQuestions: totalQ,
+        timeSpentSeconds: totalTimeSec,
+        answers: finalAnswers,
       });
 
-      if (res.ok) {
-        const result = await res.json();
-        setCompletionResult(result);
-      }
-    } catch (err) {
-      console.log('Error submitting quiz results:', err);
+      setIsOfflineSaved(true);
+      const starsMap: Record<string, number> = { easy: 10, medium: 20, hard: 30 };
+      const starsEarned = isPassed ? (starsMap[difficulty] || 10) : 0;
+
+      // Optimistic completion result so visual celebrations and unlocks function smoothly
+      setCompletionResult({
+        accuracy_pct: accuracyPct,
+        passed: isPassed,
+        stars_earned: starsEarned,
+        unlocked_medium: isPassed && difficulty === 'easy',
+        unlocked_hard: isPassed && difficulty === 'medium',
+        unlocked_next_lesson: false,
+      });
     } finally {
       setSubmittingResults(false);
     }
@@ -476,7 +565,7 @@ export default function QuizScreen() {
     );
   }
 
-  // 🔒 Locked Quiz Screen
+  // Locked Quiz Screen
   if (lockedError) {
     return (
       <SafeAreaView style={styles.safeArea}>
@@ -505,7 +594,7 @@ export default function QuizScreen() {
     );
   }
 
-  // 🎉 Finished Screen (Pass / Fail)
+  // Finished Screen (Pass / Fail)
   if (isFinished) {
     const accuracy = completionResult ? completionResult.accuracy_pct : Math.round((score / quizQuestions.length) * 100);
     const passed = completionResult ? completionResult.passed : accuracy >= 70;
@@ -531,6 +620,22 @@ export default function QuizScreen() {
           <Text style={styles.difficultyBadge}>
             Difficulty: {difficulty.toUpperCase()}
           </Text>
+
+          {/* Offline Saved Indicator (Auditory-Free, No Emojis) */}
+          {isOfflineSaved && (
+            <View style={styles.offlineSavedBox}>
+              <Ionicons name="cloud-offline-outline" size={16} color="#D97706" style={{ marginRight: 6 }} />
+              <Text style={styles.offlineSavedText}>Saved Offline: Queued for automatic synchronization</Text>
+            </View>
+          )}
+
+          {/* Stars Earned Banner */}
+          {completionResult?.stars_earned ? (
+            <View style={styles.starsEarnedRow}>
+              <Ionicons name="star" size={18} color="#F59E0B" style={{ marginRight: 6 }} />
+              <Text style={styles.starsEarnedText}>+{completionResult.stars_earned} Stars Earned</Text>
+            </View>
+          ) : null}
 
           {/* Celebration Unlocks */}
           {completionResult?.unlocked_medium && (
@@ -694,9 +799,11 @@ export default function QuizScreen() {
                       onPress={() => handleSelectOption(idx)}
                     >
                       <View style={styles.optionLetterBox}>
-                        <Text style={[styles.optionLetter, isEliminated && { color: '#9CA3AF' }]}>
-                          {isEliminated ? '✕' : option.id}
-                        </Text>
+                        {isEliminated ? (
+                          <Ionicons name="close" size={14} color="#9CA3AF" />
+                        ) : (
+                          <Text style={styles.optionLetter}>{option.id}</Text>
+                        )}
                       </View>
                       <Text style={[styles.optionText, isEliminated && styles.optionTextEliminated]}>
                         {isDeafEnglish ? option.deafText : option.text}
@@ -946,6 +1053,7 @@ const styles = StyleSheet.create({
   scrollContent: { padding: 20 },
   questionCard: { backgroundColor: 'white', borderRadius: 20, padding: 20, borderWidth: 1, borderColor: '#E5E7EB' },
   questionText: { fontSize: 18, fontWeight: 'bold', color: '#1F2937', marginBottom: 16, lineHeight: 26 },
+  questionImageWrapper: { width: '100%', alignItems: 'center', marginBottom: 16 },
   questionImage: { width: '100%', height: 180, borderRadius: 12, marginBottom: 16 },
   optionsContainer: { gap: 12 },
   optionCard: { flexDirection: 'row', alignItems: 'center', padding: 14, borderRadius: 12, borderWidth: 1, borderColor: '#E5E7EB', backgroundColor: '#F9FAFB' },
@@ -1048,5 +1156,39 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.25,
     shadowRadius: 4,
     elevation: 6,
+  },
+  offlineSavedBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FEF3C7',
+    borderWidth: 1,
+    borderColor: '#FCD34D',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 12,
+    marginTop: 10,
+    marginBottom: 6,
+  },
+  offlineSavedText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#D97706',
+  },
+  starsEarnedRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FEF3C7',
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 16,
+    marginTop: 8,
+    marginBottom: 6,
+    borderWidth: 1,
+    borderColor: '#FDE68A',
+  },
+  starsEarnedText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#B45309',
   },
 });

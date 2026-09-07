@@ -5,6 +5,7 @@ import * as Haptics from 'expo-haptics';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useAuth } from '../context/AuthContext';
 import { API_URL } from '../context/config';
+import { cacheFlashcards, getCachedFlashcards } from '../context/OfflineCache';
 
 const { width } = Dimensions.get('window');
 
@@ -86,10 +87,20 @@ export default function FlashcardsScreen() {
       const res = await fetch(`${API_URL}/flashcards/${topicId}`);
       if (res.ok) {
         const data = await res.json();
-        setCards(data.cards || []);
+        const loadedCards = data.cards || [];
+        setCards(loadedCards);
+        if (loadedCards.length > 0) {
+          await cacheFlashcards(topicId, loadedCards);
+        }
+      } else {
+        throw new Error('Server returned error status');
       }
     } catch (err) {
-      console.log('Error fetching flashcards:', err);
+      console.log('Error fetching flashcards, falling back to cache (offline):', err);
+      const cached = await getCachedFlashcards(topicId);
+      if (cached && cached.length > 0) {
+        setCards(cached);
+      }
     } finally {
       setLoading(false);
     }

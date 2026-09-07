@@ -516,6 +516,16 @@ class QuizCompleteRequest(BaseModel):
     time_spent_seconds: int
     answers: list[AnswerInput]
 
+class QuizOfflineSyncRequest(BaseModel):
+    user_id: int
+    quiz_id: int
+    attempt_id: Optional[int] = None
+    difficulty: str = 'easy'
+    score: int
+    total_questions: int
+    time_spent_seconds: int = 0
+    answers: list[AnswerInput]
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Auth endpoints ────────────────────────────────────────────────────────────
@@ -1324,6 +1334,182 @@ def complete_quiz_session(attempt_id: int, body: QuizCompleteRequest):
                 )
 
         # Phase 3: update streak on every quiz completion
+        _update_student_streak(cur, user_id)
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {
+            "success": True,
+            "score": body.score,
+            "total": total,
+            "accuracy_pct": accuracy_pct,
+            "passed": passed,
+            "stars_earned": stars_earned,
+            "unlocked_medium": unlocked_medium,
+            "unlocked_hard": unlocked_hard,
+            "unlocked_next_lesson": unlocked_next_lesson,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/quiz/offline-sync")
+def offline_sync_quiz(body: QuizOfflineSyncRequest):
+    """
+    Ingests and reconciles quiz attempts completed while offline.
+    Recalculates BKT mastery, updates lesson gating, awards stars, and refreshes streaks.
+    """
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        user_id = body.user_id
+        quiz_id = body.quiz_id
+        difficulty = body.difficulty or "easy"
+        total = body.total_questions or max(len(body.answers), 1)
+
+        # 1. Fetch quiz + lesson info
+        cur.execute(
+            "SELECT q.topic_id, l.lesson_group_id FROM quizzes q LEFT JOIN lessons l ON q.lesson_id = l.id WHERE q.id = %s",
+            (quiz_id,)
+        )
+        quiz_info = cur.fetchone()
+        topic_id = quiz_info["topic_id"] if quiz_info else None
+        lesson_group_id = quiz_info["lesson_group_id"] if quiz_info else None
+
+        threshold = _get_pass_threshold(cur, topic_id) if topic_id else 70.0
+        accuracy_pct = round((body.score / total) * 100, 2)
+        passed = accuracy_pct >= threshold
+
+        # 2. Check if attempt_id exists or create new attempt record
+        attempt_id = None
+        if body.attempt_id:
+            cur.execute("SELECT id FROM student_quiz_attempts WHERE id = %s", (body.attempt_id,))
+            existing = cur.fetchone()
+            if existing:
+                attempt_id = existing["id"]
+
+        question_ids = [ans.question_id for ans in body.answers]
+
+        if attempt_id:
+            cur.execute(
+                """UPDATE student_quiz_attempts
+                   SET completed_at = NOW(), score = %s, total_questions = %s, time_spent_seconds = %s
+                   WHERE id = %s""",
+                (body.score, total, body.time_spent_seconds, attempt_id)
+            )
+        else:
+            cur.execute(
+                """INSERT INTO student_quiz_attempts
+                   (user_id, quiz_id, question_ids, started_at, completed_at, score, total_questions, time_spent_seconds, difficulty)
+                   VALUES (%s, %s, %s, NOW() - (%s || ' seconds')::INTERVAL, NOW(), %s, %s, %s, %s)
+                   RETURNING id""",
+                (user_id, quiz_id, question_ids, body.time_spent_seconds, body.score, total, body.time_spent_seconds, difficulty)
+            )
+            attempt_id = cur.fetchone()["id"]
+
+        # 3. Save answers and update BKT
+        for ans in body.answers:
+            cur.execute(
+                """INSERT INTO student_question_answers (attempt_id, question_id, is_correct, time_spent_seconds)
+                   VALUES (%s, %s, %s, %s)""",
+                (attempt_id, ans.question_id, ans.is_correct, ans.time_spent_seconds)
+            )
+            cur.execute("SELECT knowledge_component FROM questions WHERE id = %s", (ans.question_id,))
+            q_row = cur.fetchone()
+            if q_row and q_row["knowledge_component"]:
+                _upsert_kc_mastery(cur, user_id, q_row["knowledge_component"], ans.is_correct)
+
+        # 4. Update lesson progress
+        unlocked_medium = False
+        unlocked_hard = False
+        unlocked_next_lesson = False
+
+        if lesson_group_id:
+            cur.execute(
+                "SELECT * FROM student_lesson_progress WHERE user_id = %s AND lesson_group_id = %s",
+                (user_id, lesson_group_id)
+            )
+            prog = cur.fetchone()
+
+            if not prog:
+                cur.execute(
+                    """INSERT INTO student_lesson_progress
+                       (user_id, lesson_group_id, easy_passed, medium_passed, hard_passed,
+                        easy_best_score, medium_best_score, hard_best_score, attempts_count)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1)""",
+                    (
+                        user_id, lesson_group_id,
+                        passed if difficulty == "easy" else False,
+                        passed if difficulty == "medium" else False,
+                        passed if difficulty == "hard" else False,
+                        accuracy_pct if difficulty == "easy" else 0.0,
+                        accuracy_pct if difficulty == "medium" else 0.0,
+                        accuracy_pct if difficulty == "hard" else 0.0,
+                    )
+                )
+                unlocked_medium = passed and difficulty == "easy"
+                unlocked_hard = passed and difficulty == "medium"
+            else:
+                score_col = f"{difficulty}_best_score"
+                passed_col = f"{difficulty}_passed"
+                curr_best = prog.get(score_col) or 0.0
+                new_best = max(curr_best, accuracy_pct)
+                already_passed = bool(prog.get(passed_col))
+                new_passed = already_passed or passed
+
+                cur.execute(
+                    f"""UPDATE student_lesson_progress
+                       SET {score_col} = %s, {passed_col} = %s,
+                           attempts_count = attempts_count + 1, last_updated = NOW()
+                       WHERE user_id = %s AND lesson_group_id = %s""",
+                    (new_best, new_passed, user_id, lesson_group_id)
+                )
+
+                if difficulty == "easy" and passed and not already_passed:
+                    unlocked_medium = True
+                elif difficulty == "medium" and passed and not already_passed:
+                    unlocked_hard = True
+
+        # 5. Stars and profiles
+        stars_map = {"easy": 10, "medium": 20, "hard": 30}
+        stars_earned = stars_map.get(difficulty, 10) if passed else 0
+
+        if topic_id:
+            cur.execute("SELECT * FROM student_profiles WHERE user_id = %s AND topic_id = %s", (user_id, topic_id))
+            profile = cur.fetchone()
+            if profile:
+                new_avg = round(
+                    (profile["avg_accuracy"] * profile["quizzes_completed"] + accuracy_pct)
+                    / (profile["quizzes_completed"] + 1), 2
+                )
+                avg_time = round(
+                    (profile["avg_time_seconds"] * profile["quizzes_completed"] + (body.time_spent_seconds / total))
+                    / (profile["quizzes_completed"] + 1), 2
+                ) if total > 0 else profile["avg_time_seconds"]
+                cur.execute(
+                    """UPDATE student_profiles
+                       SET avg_accuracy = %s, avg_time_seconds = %s,
+                           quizzes_completed = quizzes_completed + 1,
+                           total_stars = total_stars + %s,
+                           knowledge_level = %s, last_updated = NOW()
+                       WHERE user_id = %s AND topic_id = %s""",
+                    (new_avg, avg_time, stars_earned, difficulty, user_id, topic_id)
+                )
+            else:
+                avg_time = round(body.time_spent_seconds / total, 2) if total > 0 else 0
+                cur.execute(
+                    """INSERT INTO student_profiles
+                       (user_id, topic_id, avg_accuracy, avg_time_seconds, quizzes_completed, total_stars, knowledge_level)
+                       VALUES (%s, %s, %s, %s, 1, %s, %s)
+                       ON CONFLICT (user_id, topic_id) DO NOTHING""",
+                    (user_id, topic_id, accuracy_pct, avg_time, stars_earned, difficulty)
+                )
+
         _update_student_streak(cur, user_id)
 
         conn.commit()

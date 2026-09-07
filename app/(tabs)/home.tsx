@@ -5,6 +5,12 @@ import { SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, View, Ani
 import { useAuth } from "../../context/AuthContext";
 import { useSubjects } from "../../context/SubjectsContext";
 import { API_URL } from "../../context/config";
+import {
+  cacheHomeSummary,
+  getCachedHomeSummary,
+  syncPendingQuizzes,
+  getPendingQuizzes,
+} from "../../context/OfflineCache";
 
 export default function HomeScreen() {
   const { user } = useAuth();
@@ -15,6 +21,9 @@ export default function HomeScreen() {
   const [totalStars, setTotalStars] = useState<number>(0);
   const [streak, setStreak] = useState<number>(0);
   const [topicProgress, setTopicProgress] = useState<{ [topicId: string]: { stars: number; progress: number } }>({});
+  const [pendingCount, setPendingCount] = useState<number>(0);
+  const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [isOffline, setIsOffline] = useState<boolean>(false);
 
   // Subtle Flame Flicker / Pulse for active study streak
   const flameAnim = useRef(new Animated.Value(1)).current;
@@ -53,8 +62,10 @@ export default function HomeScreen() {
       const res = await fetch(`${API_URL}/student/${userId}/home-summary`);
       if (res.ok) {
         const data = await res.json();
+        setIsOffline(false);
         setTotalStars(data.total_stars ?? 0);
         setStreak(data.current_streak ?? 0);
+
         if (data.topics) {
           const map: { [topicId: string]: { stars: number; progress: number } } = {};
           if (Array.isArray(data.topics)) {
@@ -68,15 +79,56 @@ export default function HomeScreen() {
           }
           setTopicProgress(map);
         }
+
+        // Cache summary for offline access
+        await cacheHomeSummary(userId, data);
+      } else {
+        throw new Error('Server returned error status');
       }
     } catch (err) {
-      console.log("Error fetching home summary:", err);
+      console.log('Using cached home summary (offline):', err);
+      setIsOffline(true);
+      const cached = await getCachedHomeSummary(userId);
+      if (cached) {
+        setTotalStars(cached.total_stars ?? 0);
+        setStreak(cached.current_streak ?? 0);
+        if (cached.topics) {
+          const map: { [topicId: string]: { stars: number; progress: number } } = {};
+          if (Array.isArray(cached.topics)) {
+            cached.topics.forEach((t: any) => {
+              map[t.topic_id] = { stars: t.stars_earned ?? t.stars ?? 0, progress: t.progress_pct ?? t.progress ?? 0 };
+            });
+          } else if (typeof cached.topics === 'object') {
+            Object.entries(cached.topics).forEach(([topicId, t]: [string, any]) => {
+              map[topicId] = { stars: t.stars_earned ?? t.stars ?? 0, progress: t.progress_pct ?? t.progress ?? 0 };
+            });
+          }
+          setTopicProgress(map);
+        }
+      }
     }
   }, [userId]);
 
   useFocusEffect(
     useCallback(() => {
-      fetchHomeSummary();
+      const checkAndSync = async () => {
+        await fetchHomeSummary();
+        const pending = await getPendingQuizzes();
+        setPendingCount(pending.length);
+
+        if (pending.length > 0) {
+          setIsSyncing(true);
+          const syncRes = await syncPendingQuizzes(API_URL);
+          setIsSyncing(false);
+          if (syncRes.synced > 0) {
+            await fetchHomeSummary();
+          }
+          const remaining = await getPendingQuizzes();
+          setPendingCount(remaining.length);
+        }
+      };
+
+      checkAndSync();
     }, [fetchHomeSummary])
   );
 
@@ -95,6 +147,24 @@ export default function HomeScreen() {
             <Text style={styles.subGreeting}>Keep learning and earning stars</Text>
           </View>
         </View>
+
+        {/* Offline & Sync Status Pill (Auditory-Free, No Emojis) */}
+        {isSyncing ? (
+          <View style={styles.syncBadgeCyan}>
+            <Ionicons name="sync-outline" size={14} color="#0284C7" style={{ marginRight: 6 }} />
+            <Text style={styles.syncBadgeTextCyan}>Syncing {pendingCount} offline quiz attempt{pendingCount > 1 ? 's' : ''}...</Text>
+          </View>
+        ) : pendingCount > 0 ? (
+          <View style={styles.syncBadgeAmber}>
+            <Ionicons name="cloud-offline-outline" size={14} color="#D97706" style={{ marginRight: 6 }} />
+            <Text style={styles.syncBadgeTextAmber}>Offline Mode: {pendingCount} quiz attempt{pendingCount > 1 ? 's' : ''} queued for sync</Text>
+          </View>
+        ) : isOffline ? (
+          <View style={styles.syncBadgeAmber}>
+            <Ionicons name="cloud-offline-outline" size={14} color="#D97706" style={{ marginRight: 6 }} />
+            <Text style={styles.syncBadgeTextAmber}>Offline Mode: Using cached lesson data</Text>
+          </View>
+        ) : null}
 
         {/* Twin Stats Cards Row */}
         <View style={styles.statsRow}>
@@ -381,5 +451,39 @@ const styles = StyleSheet.create({
     height: 8,
     backgroundColor: "#12B3C9",
     borderRadius: 4,
+  },
+  syncBadgeCyan: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#E0F2FE',
+    borderWidth: 1,
+    borderColor: '#38BDF8',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 20,
+    marginBottom: 16,
+    alignSelf: 'flex-start',
+  },
+  syncBadgeTextCyan: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#0284C7',
+  },
+  syncBadgeAmber: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FEF3C7',
+    borderWidth: 1,
+    borderColor: '#FCD34D',
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderRadius: 20,
+    marginBottom: 16,
+    alignSelf: 'flex-start',
+  },
+  syncBadgeTextAmber: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#D97706',
   },
 });

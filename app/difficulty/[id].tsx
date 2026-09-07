@@ -5,6 +5,7 @@ import { SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, View, Mod
 import * as Haptics from 'expo-haptics';
 import { useAuth } from "../../context/AuthContext";
 import { API_URL } from "../../context/config";
+import { getCachedTopicLessons, getCachedStudentProgress } from "../../context/OfflineCache";
 
 interface Slide {
   slide_index: number;
@@ -146,7 +147,31 @@ export default function DifficultyScreen() {
         }
       }
     } catch (err) {
-      console.log("Error fetching difficulty data:", err);
+      console.log("Error fetching difficulty data, falling back to cache (offline):", err);
+      try {
+        const cachedGroups = await getCachedTopicLessons(topicId as string);
+        if (cachedGroups) {
+          const foundGroup = cachedGroups.find((g: any) => g.id === Number(lessonGroupId));
+          if (foundGroup) {
+            setGroupTitle(foundGroup.title);
+            const map: Record<string, DBLesson> = {};
+            (foundGroup.lessons || []).forEach((l: DBLesson) => {
+              map[l.difficulty] = l;
+            });
+            setLessonsMap(map);
+          }
+        }
+        const cachedProg = await getCachedStudentProgress(userId, topicId as string);
+        if (cachedProg) {
+          const progList = Array.isArray(cachedProg) ? cachedProg : Object.values(cachedProg);
+          const found = progList.find((p: any) => p.lesson_group_id === Number(lessonGroupId));
+          if (found) {
+            setProgress(found);
+          }
+        }
+      } catch (cacheErr) {
+        console.log("Error reading difficulty cache:", cacheErr);
+      }
     } finally {
       setLoading(false);
     }
@@ -265,7 +290,7 @@ export default function DifficultyScreen() {
               key={diff}
               style={[
                 styles.diffCard,
-                styles[`diffCard_${diff}` as keyof typeof styles],
+                (styles as any)[`diffCard_${diff}`],
                 !unlocked && styles.diffCardLocked,
                 !lessonExists && styles.diffCardMissing,
               ]}

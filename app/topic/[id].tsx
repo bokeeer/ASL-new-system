@@ -5,10 +5,16 @@ import { SafeAreaView, ScrollView, StyleSheet, Text, TouchableOpacity, View, Act
 import { useSubjects } from "../../context/SubjectsContext";
 import { useAuth } from "../../context/AuthContext";
 import { API_URL } from "../../context/config";
+import {
+  cacheTopicLessons,
+  getCachedTopicLessons,
+  cacheStudentProgress,
+  getCachedStudentProgress,
+} from "../../context/OfflineCache";
 
 interface LessonGroup {
   id: number;
-  topic_id: str;
+  topic_id: string;
   title: string;
   order_index: number;
   lessons: any[];
@@ -50,6 +56,7 @@ export default function TopicScreen() {
   const [lessonGroups, setLessonGroups] = useState<LessonGroup[]>([]);
   const [studentProgress, setStudentProgress] = useState<Record<number, LessonProgress>>({});
   const [loading, setLoading] = useState(true);
+  const [isOffline, setIsOffline] = useState(false);
 
   // Subtle "Active Lesson" Breathing Pulse (Visual Signifier for DHH Learners)
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -94,10 +101,29 @@ export default function TopicScreen() {
         }
       }
 
+      setIsOffline(false);
       setLessonGroups(groupsData);
       setStudentProgress(progMap);
+
+      // Cache for offline resilience
+      if (groupsData.length > 0) {
+        await cacheTopicLessons(id as string, groupsData);
+      }
+      if (Object.keys(progMap).length > 0) {
+        await cacheStudentProgress(userId, id as string, progMap);
+      }
     } catch (err) {
-      console.log("Error fetching topic data:", err);
+      console.log("Error fetching topic data, restoring from cache (offline):", err);
+      setIsOffline(true);
+      const cachedGroups = await getCachedTopicLessons(id as string);
+      const cachedProg = await getCachedStudentProgress(userId, id as string);
+
+      if (cachedGroups && cachedGroups.length > 0) {
+        setLessonGroups(cachedGroups);
+      }
+      if (cachedProg) {
+        setStudentProgress(cachedProg);
+      }
     } finally {
       setLoading(false);
     }
@@ -151,6 +177,14 @@ export default function TopicScreen() {
         </TouchableOpacity>
         <Text style={styles.headerTitle}>{topic.name}</Text>
       </View>
+
+      {/* Offline Mode Indicator (Auditory-Free, No Emojis) */}
+      {isOffline && (
+        <View style={styles.offlineBanner}>
+          <Ionicons name="cloud-offline-outline" size={14} color="#D97706" style={{ marginRight: 6 }} />
+          <Text style={styles.offlineBannerText}>Offline Mode: Showing cached lesson cards</Text>
+        </View>
+      )}
 
       <ScrollView contentContainerStyle={styles.scrollViewContent}>
         {lessonGroups.length === 0 ? (
@@ -259,4 +293,21 @@ const styles = StyleSheet.create({
   questSubtitle: { fontSize: 13, color: "#6B7280" },
   badge: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20 },
   badgeText: { color: "white", fontSize: 12, fontWeight: "bold" },
+  offlineBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FEF3C7',
+    borderWidth: 1,
+    borderColor: '#FCD34D',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    marginHorizontal: 20,
+    marginBottom: 8,
+    borderRadius: 12,
+  },
+  offlineBannerText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#D97706',
+  },
 });
