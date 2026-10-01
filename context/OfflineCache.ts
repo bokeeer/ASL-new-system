@@ -26,6 +26,8 @@ const KEYS = {
   FLASHCARDS_PREFIX: '@brightpath_cache_flashcards_',
   QUIZ_SESSION_PREFIX: '@brightpath_cache_quiz_session_',
   PENDING_QUEUE: '@brightpath_pending_quiz_queue',
+  KC_MASTERY_PREFIX: '@brightpath_kc_mastery_',
+  KC_MASTERY_LIST_PREFIX: '@brightpath_cache_kc_mastery_list_',
 };
 
 // Generic storage helpers
@@ -177,3 +179,137 @@ export const checkOnlineStatus = async (apiBaseUrl: string): Promise<boolean> =>
     return false;
   }
 };
+
+// ── Client-Side Bayesian Knowledge Tracing (BKT) Engine ───────────────────────
+
+export interface BKTParameters {
+  prior: number;   // P(L_0) initial probability of mastery (default: 0.10)
+  learns: number;  // P(T) transition probability not_learned -> learned (default: 0.20)
+  guesses: number; // P(G) probability of correct answer despite not knowing (default: 0.25)
+  slips: number;   // P(S) probability of wrong answer despite knowing (default: 0.10)
+}
+
+export interface StudentKCMastery {
+  kc_name: string;
+  display_name?: string;
+  p_mastery: number;
+  p_mastery_pct: number;
+  status: 'mastered' | 'learning' | 'struggling' | 'not_started';
+  correct_count: number;
+  wrong_count: number;
+  total_opportunities: number;
+  last_updated: number;
+}
+
+export const DEFAULT_BKT_PARAMS: BKTParameters = {
+  prior: 0.10,
+  learns: 0.20,
+  guesses: 0.25,
+  slips: 0.10,
+};
+
+/**
+ * Standard Bayesian Knowledge Tracing (BKT) update formula.
+ * Mathematically identical to pyBKT and server.py.
+ */
+export function bktUpdate(
+  pKnow: number,
+  isCorrect: boolean,
+  params: BKTParameters = DEFAULT_BKT_PARAMS
+): number {
+  const { learns, guesses, slips } = params;
+  let numerator: number;
+  let denominator: number;
+
+  if (isCorrect) {
+    numerator = pKnow * (1.0 - slips);
+    denominator = numerator + (1.0 - pKnow) * guesses;
+  } else {
+    numerator = pKnow * slips;
+    denominator = numerator + (1.0 - pKnow) * (1.0 - guesses);
+  }
+
+  const pKnowGivenObs = numerator / Math.max(denominator, 1e-9);
+  const pKnowNext = pKnowGivenObs + (1.0 - pKnowGivenObs) * learns;
+  return Math.round(Math.min(0.99, Math.max(0.01, pKnowNext)) * 10000) / 10000;
+}
+
+export function getBKTStatus(
+  pMastery: number,
+  totalOpportunities: number
+): 'mastered' | 'learning' | 'struggling' | 'not_started' {
+  if (totalOpportunities === 0) return 'not_started';
+  if (pMastery >= 0.70) return 'mastered';
+  if (pMastery >= 0.30) return 'learning';
+  return 'struggling';
+}
+
+export const getLocalKCMastery = async (
+  userId: number,
+  kcName: string
+): Promise<StudentKCMastery> => {
+  const key = `${KEYS.KC_MASTERY_PREFIX}${userId}_${kcName}`;
+  const cached = await getCache<StudentKCMastery>(key);
+  if (cached) return cached;
+  return {
+    kc_name: kcName,
+    display_name: kcName.replace(/_/g, ' '),
+    p_mastery: DEFAULT_BKT_PARAMS.prior,
+    p_mastery_pct: Math.round(DEFAULT_BKT_PARAMS.prior * 100),
+    status: 'not_started',
+    correct_count: 0,
+    wrong_count: 0,
+    total_opportunities: 0,
+    last_updated: Date.now(),
+  };
+};
+
+export const getAllLocalKCMastery = async (
+  userId: number
+): Promise<Record<string, StudentKCMastery>> => {
+  const key = `${KEYS.KC_MASTERY_PREFIX}all_${userId}`;
+  return (await getCache<Record<string, StudentKCMastery>>(key)) || {};
+};
+
+export const updateLocalKCMastery = async (
+  userId: number,
+  kcName: string,
+  isCorrect: boolean,
+  customParams?: BKTParameters
+): Promise<StudentKCMastery> => {
+  const cleanKc = kcName || 'general_comprehension';
+  const current = await getLocalKCMastery(userId, cleanKc);
+  const newMastery = bktUpdate(current.p_mastery, isCorrect, customParams || DEFAULT_BKT_PARAMS);
+  const totalOpp = current.total_opportunities + 1;
+  const newStatus = getBKTStatus(newMastery, totalOpp);
+
+  const updated: StudentKCMastery = {
+    kc_name: cleanKc,
+    display_name: cleanKc.replace(/_/g, ' '),
+    p_mastery: newMastery,
+    p_mastery_pct: Math.round(newMastery * 1000) / 10,
+    status: newStatus,
+    correct_count: current.correct_count + (isCorrect ? 1 : 0),
+    wrong_count: current.wrong_count + (isCorrect ? 0 : 1),
+    total_opportunities: totalOpp,
+    last_updated: Date.now(),
+  };
+
+  await setCache(`${KEYS.KC_MASTERY_PREFIX}${userId}_${cleanKc}`, updated);
+
+  const allKey = `${KEYS.KC_MASTERY_PREFIX}all_${userId}`;
+  const all = (await getCache<Record<string, StudentKCMastery>>(allKey)) || {};
+  all[cleanKc] = updated;
+  await setCache(allKey, all);
+
+  return updated;
+};
+
+export const cacheKCMasteryList = async (userId: number, data: any): Promise<void> => {
+  await setCache(`${KEYS.KC_MASTERY_LIST_PREFIX}${userId}`, data);
+};
+
+export const getCachedKCMasteryList = async (userId: number): Promise<any | null> => {
+  return await getCache(`${KEYS.KC_MASTERY_LIST_PREFIX}${userId}`);
+};
+

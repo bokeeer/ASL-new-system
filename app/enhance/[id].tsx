@@ -62,7 +62,7 @@ export default function EnhanceScreen() {
         {excellingTopics.length > 0 && (
           <View style={styles.sectionContainer}>
             <View style={styles.sectionHeader}>
-              <Text style={styles.sectionTitle}>You're Excelling! 🎉</Text>
+              <Text style={styles.sectionTitle}>You're Excelling!</Text>
             </View>
 
             {excellingTopics.map(topic => (

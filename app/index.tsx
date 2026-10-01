@@ -42,12 +42,6 @@ export default function LoginScreen() {
       return;
     }
 
-    // Admin shortcut
-    if (username.trim().toLowerCase() === "user" && password === "password") {
-      router.replace("/admin");
-      return;
-    }
-
     setLoading(true);
     try {
       const res = await fetch(`${API_URL}/login`, {
@@ -61,7 +55,13 @@ export default function LoginScreen() {
         return;
       }
       setUser(data.user);
-      router.replace("/(tabs)/home");
+      if (data.user?.role === "admin") {
+        router.replace("/admin" as any);
+      } else if (data.user?.role === "teacher") {
+        router.replace("/teacher" as any);
+      } else {
+        router.replace("/(tabs)/home");
+      }
     } catch {
       setLoginError("Cannot reach the server. Make sure it is running.");
     } finally {

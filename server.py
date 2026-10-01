@@ -7,12 +7,15 @@ from transformers import MBart50TokenizerFast, MBartForConditionalGeneration
 from passlib.context import CryptContext
 import psycopg2
 import psycopg2.extras
-import pandas as pd
+import re
 import os
 import shutil
 import uuid
 import random
 from datetime import datetime
+
+# Password hashing
+pwd_context = CryptContext(schemes=["sha256_crypt"], deprecated="auto")
 
 # Load .env file using standard library
 def load_env_file():
@@ -229,17 +232,48 @@ def init_db():
             );
         """)
 
+        # ── User Roles & Plain Passwords ──────────────────────────────────────
+        cur.execute("""
+            ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'student',
+                ADD COLUMN IF NOT EXISTS plain_password VARCHAR(255);
+        """)
+
+        # Ensure Admin account exists with requested password 'wvsuadmin123'
+        admin_hash = pwd_context.hash("wvsuadmin123")
+        cur.execute("SELECT id FROM users WHERE username = 'admin'")
+        admin_row = cur.fetchone()
+        if admin_row:
+            cur.execute("UPDATE users SET password_hash = %s, role = 'admin', plain_password = 'wvsuadmin123' WHERE username = 'admin'", (admin_hash,))
+        else:
+            cur.execute(
+                "INSERT INTO users (name, username, password_hash, role, plain_password) VALUES (%s, %s, %s, %s, %s)",
+                ("Administrator", "admin", admin_hash, "admin", "wvsuadmin123")
+            )
+
+        # Ensure default Teacher account exists ('teacher' / 'teacher123')
+        teacher_hash = pwd_context.hash("teacher123")
+        cur.execute("SELECT id FROM users WHERE username = 'teacher'")
+        teacher_row = cur.fetchone()
+        if teacher_row:
+            cur.execute("UPDATE users SET role = 'teacher', plain_password = 'teacher123' WHERE username = 'teacher'")
+        else:
+            cur.execute(
+                "INSERT INTO users (name, username, password_hash, role, plain_password) VALUES (%s, %s, %s, %s, %s)",
+                ("Teacher", "teacher", teacher_hash, "teacher", "teacher123")
+            )
+
+        # Ensure dev user 'user' has role 'teacher' and plain_password 'password'
+        cur.execute("UPDATE users SET role = 'teacher', plain_password = 'password' WHERE username = 'user'")
+
         conn.commit()
         cur.close()
         conn.close()
-        print("Database initialized successfully.")
+        print("Database initialized successfully with RBAC roles and password tracking.")
     except Exception as e:
         print("Database init error:", e)
 
 init_db()
-
-# ── Password hashing ─────────────────────────────────────────────────────────
-pwd_context = CryptContext(schemes=["sha256_crypt"], deprecated="auto")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Phase 3: Streak Helper ────────────────────────────────────────────────────
@@ -526,6 +560,21 @@ class QuizOfflineSyncRequest(BaseModel):
     time_spent_seconds: int = 0
     answers: list[AnswerInput]
 
+class CreateTeacherRequest(BaseModel):
+    name: str
+    username: str
+    password: str
+
+class UpdateUserRoleRequest(BaseModel):
+    role: str
+
+class AdminResetPasswordRequest(BaseModel):
+    password: str
+
+class AdminDeleteUserRequest(BaseModel):
+    admin_password: str
+    admin_id: Optional[int] = None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Auth endpoints ────────────────────────────────────────────────────────────
@@ -540,8 +589,8 @@ def register(req: RegisterRequest):
         conn = get_db()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            "INSERT INTO users (name, username, password_hash) VALUES (%s, %s, %s) RETURNING id, name, username",
-            (req.name.strip(), req.username.strip().lower(), hashed),
+            "INSERT INTO users (name, username, password_hash, role, plain_password) VALUES (%s, %s, %s, 'student', %s) RETURNING id, name, username, role",
+            (req.name.strip(), req.username.strip().lower(), hashed, req.password.strip()),
         )
         user = cur.fetchone()
         conn.commit()
@@ -560,7 +609,7 @@ def login(req: LoginRequest):
         conn = get_db()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            "SELECT id, name, username, password_hash FROM users WHERE username = %s",
+            "SELECT id, name, username, password_hash, role FROM users WHERE username = %s",
             (req.username.strip().lower(),),
         )
         user = cur.fetchone()
@@ -572,7 +621,12 @@ def login(req: LoginRequest):
 
         return {
             "success": True,
-            "user": {"id": user["id"], "name": user["name"], "username": user["username"]},
+            "user": {
+                "id": user["id"],
+                "name": user["name"],
+                "username": user["username"],
+                "role": user.get("role") or "student"
+            },
         }
     except HTTPException:
         raise
@@ -596,10 +650,25 @@ def create_lesson_group(req: LessonGroupCreateRequest):
             (req.topic_id.strip(), req.title.strip(), req.order_index),
         )
         group = dict(cur.fetchone())
+
+        # ── Automatically create Knowledge Component (KC) for this lesson group ──
+        clean_title = req.title.strip()
+        slug = re.sub(r'[^a-z0-9]+', '_', clean_title.lower()).strip('_')
+        kc_name = f"kc_{slug}"
+        display_name = f"{clean_title} Mastery"
+        cur.execute(
+            """INSERT INTO knowledge_components (topic_id, name, display_name, prior, learns, guesses, slips)
+               VALUES (%s, %s, %s, 0.10, 0.20, 0.25, 0.10)
+               ON CONFLICT (name) DO UPDATE SET
+                   topic_id = EXCLUDED.topic_id,
+                   display_name = EXCLUDED.display_name""",
+            (req.topic_id.strip(), kc_name, display_name)
+        )
+
         conn.commit()
         cur.close()
         conn.close()
-        return {"success": True, "lesson_group": group}
+        return {"success": True, "lesson_group": group, "auto_kc": kc_name}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -883,6 +952,28 @@ def create_quiz(req: QuizCreateRequest):
 
             img_val = q.image_url.strip() if q.image_url else None
             kc_val = q.knowledge_component.strip() if q.knowledge_component else None
+
+            # If no KC provided, automatically inherit and ensure the lesson's KC
+            if not kc_val:
+                cur.execute(
+                    """SELECT lg.title as group_title, l.title as lesson_title
+                       FROM lessons l
+                       LEFT JOIN lesson_groups lg ON l.lesson_group_id = lg.id
+                       WHERE l.id = %s""",
+                    (req.lesson_id,)
+                )
+                l_info = cur.fetchone()
+                base_title = (l_info["group_title"] if l_info and l_info.get("group_title") else (l_info["lesson_title"] if l_info else req.title))
+                slug = re.sub(r'[^a-z0-9]+', '_', base_title.lower().strip()).strip('_')
+                kc_val = f"kc_{slug}"
+                # Ensure it exists in knowledge_components with standard BKT defaults
+                cur.execute(
+                    """INSERT INTO knowledge_components (topic_id, name, display_name, prior, learns, guesses, slips)
+                       VALUES (%s, %s, %s, 0.10, 0.20, 0.25, 0.10)
+                       ON CONFLICT (name) DO NOTHING""",
+                    (req.topic_id.strip(), kc_val, f"{base_title} Mastery")
+                )
+
             cur.execute(
                 "INSERT INTO questions (quiz_id, question_text, correct_option_letter, question_type, image_url, knowledge_component) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
                 (quiz_id, q.question_text.strip(), correct_letter, q.question_type, img_val, kc_val)
@@ -921,7 +1012,7 @@ def _fetch_full_quiz(cur, quiz_id: int):
         return None
 
     cur.execute(
-        "SELECT id, question_text, correct_option_letter, question_type, image_url FROM questions WHERE quiz_id = %s ORDER BY id ASC",
+        "SELECT id, question_text, correct_option_letter, question_type, image_url, knowledge_component, hint FROM questions WHERE quiz_id = %s ORDER BY id ASC",
         (quiz["id"],)
     )
     questions = cur.fetchall()
@@ -954,6 +1045,8 @@ def _fetch_full_quiz(cur, quiz_id: int):
             "question_text": q["question_text"],
             "question_type": q_type,
             "image_url": q["image_url"],
+            "knowledge_component": q.get("knowledge_component") or "reading_comprehension",
+            "hint": q.get("hint") or "",
             "options": options_list,
             "correct_option_index": correct_idx,
             "matching_pairs": matching_pairs_list
@@ -1103,7 +1196,7 @@ def start_quiz_session(quiz_id: int, user_id: int):
 
         # ── Fetch all questions for this quiz ─────────────────────────────────
         cur.execute(
-            "SELECT id, question_text, correct_option_letter, question_type, image_url, knowledge_component FROM questions WHERE quiz_id = %s ORDER BY id ASC",
+            "SELECT id, question_text, correct_option_letter, question_type, image_url, knowledge_component, hint FROM questions WHERE quiz_id = %s ORDER BY id ASC",
             (quiz_id,)
         )
         all_questions = cur.fetchall()
@@ -1146,7 +1239,8 @@ def start_quiz_session(quiz_id: int, user_id: int):
                 "question_text": q["question_text"],
                 "question_type": q_type,
                 "image_url": q["image_url"],
-                "knowledge_component": q.get("knowledge_component"),
+                "knowledge_component": q.get("knowledge_component") or "reading_comprehension",
+                "hint": q.get("hint") or "",
                 "options": options_list,
                 "correct_option_index": correct_idx,
                 "matching_pairs": matching_pairs_list,
@@ -1295,43 +1389,52 @@ def complete_quiz_session(attempt_id: int, body: QuizCompleteRequest):
                 )
 
         # ── Update topic-level student profile ────────────────────────────────
-        # Phase 3: difficulty-based star reward (only awarded on pass)
-        STAR_REWARDS = {"easy": 10, "medium": 20, "hard": 30}
-        stars_earned = STAR_REWARDS.get(difficulty, 10) if passed else 0
+        # Star reward: +3 (easy), +4 (medium), +6 (hard) per correct question, awarded only on pass
+        STAR_RATES = {"easy": 3, "medium": 4, "hard": 6}
+        star_rate = STAR_RATES.get(difficulty.lower(), 3)
+        stars_earned = (body.score * star_rate) if passed else 0
 
-        if topic_id:
-            cur.execute(
-                "SELECT * FROM student_profiles WHERE user_id = %s AND topic_id = %s",
-                (user_id, topic_id)
+        # Ensure topic_id exists; if not, query it from the quiz or fallback
+        if not topic_id:
+            cur.execute("SELECT topic_id FROM quizzes WHERE id = %s", (quiz_id,))
+            q_row = cur.fetchone()
+            topic_id = q_row["topic_id"] if q_row and q_row.get("topic_id") else "story-grammar"
+
+        cur.execute(
+            "SELECT * FROM student_profiles WHERE user_id = %s AND topic_id = %s",
+            (user_id, topic_id)
+        )
+        profile = cur.fetchone()
+        if profile:
+            new_avg = round(
+                (profile["avg_accuracy"] * profile["quizzes_completed"] + accuracy_pct)
+                / (profile["quizzes_completed"] + 1), 2
             )
-            profile = cur.fetchone()
-            if profile:
-                new_avg = round(
-                    (profile["avg_accuracy"] * profile["quizzes_completed"] + accuracy_pct)
-                    / (profile["quizzes_completed"] + 1), 2
-                )
-                avg_time = round(
-                    (profile["avg_time_seconds"] * profile["quizzes_completed"] + (body.time_spent_seconds / total))
-                    / (profile["quizzes_completed"] + 1), 2
-                ) if total > 0 else profile["avg_time_seconds"]
-                cur.execute(
-                    """UPDATE student_profiles
-                       SET avg_accuracy = %s, avg_time_seconds = %s,
-                           quizzes_completed = quizzes_completed + 1,
-                           total_stars = total_stars + %s,
-                           knowledge_level = %s, last_updated = NOW()
-                       WHERE user_id = %s AND topic_id = %s""",
-                    (new_avg, avg_time, stars_earned, difficulty, user_id, topic_id)
-                )
-            else:
-                avg_time = round(body.time_spent_seconds / total, 2) if total > 0 else 0
-                cur.execute(
-                    """INSERT INTO student_profiles
-                       (user_id, topic_id, avg_accuracy, avg_time_seconds, quizzes_completed, total_stars, knowledge_level)
-                       VALUES (%s, %s, %s, %s, 1, %s, %s)
-                       ON CONFLICT (user_id, topic_id) DO NOTHING""",
-                    (user_id, topic_id, accuracy_pct, avg_time, stars_earned, difficulty)
-                )
+            avg_time = round(
+                (profile["avg_time_seconds"] * profile["quizzes_completed"] + (body.time_spent_seconds / total))
+                / (profile["quizzes_completed"] + 1), 2
+            ) if total > 0 else profile["avg_time_seconds"]
+            cur.execute(
+                """UPDATE student_profiles
+                   SET avg_accuracy = %s, avg_time_seconds = %s,
+                       quizzes_completed = quizzes_completed + 1,
+                       total_stars = total_stars + %s,
+                       knowledge_level = %s, last_updated = NOW()
+                   WHERE user_id = %s AND topic_id = %s""",
+                (new_avg, avg_time, stars_earned, difficulty, user_id, topic_id)
+            )
+        else:
+            avg_time = round(body.time_spent_seconds / total, 2) if total > 0 else 0
+            cur.execute(
+                """INSERT INTO student_profiles
+                   (user_id, topic_id, avg_accuracy, avg_time_seconds, quizzes_completed, total_stars, knowledge_level)
+                   VALUES (%s, %s, %s, %s, 1, %s, %s)
+                   ON CONFLICT (user_id, topic_id) DO UPDATE
+                   SET total_stars = student_profiles.total_stars + EXCLUDED.total_stars,
+                       quizzes_completed = student_profiles.quizzes_completed + 1,
+                       last_updated = NOW()""",
+                (user_id, topic_id, accuracy_pct, avg_time, stars_earned, difficulty)
+            )
 
         # Phase 3: update streak on every quiz completion
         _update_student_streak(cur, user_id)
@@ -1347,6 +1450,7 @@ def complete_quiz_session(attempt_id: int, body: QuizCompleteRequest):
             "accuracy_pct": accuracy_pct,
             "passed": passed,
             "stars_earned": stars_earned,
+            "star_rate": star_rate,
             "unlocked_medium": unlocked_medium,
             "unlocked_hard": unlocked_hard,
             "unlocked_next_lesson": unlocked_next_lesson,
@@ -1476,39 +1580,47 @@ def offline_sync_quiz(body: QuizOfflineSyncRequest):
                     unlocked_hard = True
 
         # 5. Stars and profiles
-        stars_map = {"easy": 10, "medium": 20, "hard": 30}
-        stars_earned = stars_map.get(difficulty, 10) if passed else 0
+        star_rates = {"easy": 3, "medium": 4, "hard": 6}
+        star_rate = star_rates.get(difficulty.lower(), 3)
+        stars_earned = (body.score * star_rate) if passed else 0
 
-        if topic_id:
-            cur.execute("SELECT * FROM student_profiles WHERE user_id = %s AND topic_id = %s", (user_id, topic_id))
-            profile = cur.fetchone()
-            if profile:
-                new_avg = round(
-                    (profile["avg_accuracy"] * profile["quizzes_completed"] + accuracy_pct)
-                    / (profile["quizzes_completed"] + 1), 2
-                )
-                avg_time = round(
-                    (profile["avg_time_seconds"] * profile["quizzes_completed"] + (body.time_spent_seconds / total))
-                    / (profile["quizzes_completed"] + 1), 2
-                ) if total > 0 else profile["avg_time_seconds"]
-                cur.execute(
-                    """UPDATE student_profiles
-                       SET avg_accuracy = %s, avg_time_seconds = %s,
-                           quizzes_completed = quizzes_completed + 1,
-                           total_stars = total_stars + %s,
-                           knowledge_level = %s, last_updated = NOW()
-                       WHERE user_id = %s AND topic_id = %s""",
-                    (new_avg, avg_time, stars_earned, difficulty, user_id, topic_id)
-                )
-            else:
-                avg_time = round(body.time_spent_seconds / total, 2) if total > 0 else 0
-                cur.execute(
-                    """INSERT INTO student_profiles
-                       (user_id, topic_id, avg_accuracy, avg_time_seconds, quizzes_completed, total_stars, knowledge_level)
-                       VALUES (%s, %s, %s, %s, 1, %s, %s)
-                       ON CONFLICT (user_id, topic_id) DO NOTHING""",
-                    (user_id, topic_id, accuracy_pct, avg_time, stars_earned, difficulty)
-                )
+        if not topic_id:
+            cur.execute("SELECT topic_id FROM quizzes WHERE id = %s", (quiz_id,))
+            q_row = cur.fetchone()
+            topic_id = q_row["topic_id"] if q_row and q_row.get("topic_id") else "story-grammar"
+
+        cur.execute("SELECT * FROM student_profiles WHERE user_id = %s AND topic_id = %s", (user_id, topic_id))
+        profile = cur.fetchone()
+        if profile:
+            new_avg = round(
+                (profile["avg_accuracy"] * profile["quizzes_completed"] + accuracy_pct)
+                / (profile["quizzes_completed"] + 1), 2
+            )
+            avg_time = round(
+                (profile["avg_time_seconds"] * profile["quizzes_completed"] + (body.time_spent_seconds / total))
+                / (profile["quizzes_completed"] + 1), 2
+            ) if total > 0 else profile["avg_time_seconds"]
+            cur.execute(
+                """UPDATE student_profiles
+                   SET avg_accuracy = %s, avg_time_seconds = %s,
+                       quizzes_completed = quizzes_completed + 1,
+                       total_stars = total_stars + %s,
+                       knowledge_level = %s, last_updated = NOW()
+                   WHERE user_id = %s AND topic_id = %s""",
+                (new_avg, avg_time, stars_earned, difficulty, user_id, topic_id)
+            )
+        else:
+            avg_time = round(body.time_spent_seconds / total, 2) if total > 0 else 0
+            cur.execute(
+                """INSERT INTO student_profiles
+                   (user_id, topic_id, avg_accuracy, avg_time_seconds, quizzes_completed, total_stars, knowledge_level)
+                   VALUES (%s, %s, %s, %s, 1, %s, %s)
+                   ON CONFLICT (user_id, topic_id) DO UPDATE
+                   SET total_stars = student_profiles.total_stars + EXCLUDED.total_stars,
+                       quizzes_completed = student_profiles.quizzes_completed + 1,
+                       last_updated = NOW()""",
+                (user_id, topic_id, accuracy_pct, avg_time, stars_earned, difficulty)
+            )
 
         _update_student_streak(cur, user_id)
 
@@ -1523,6 +1635,7 @@ def offline_sync_quiz(body: QuizOfflineSyncRequest):
             "accuracy_pct": accuracy_pct,
             "passed": passed,
             "stars_earned": stars_earned,
+            "star_rate": star_rate,
             "unlocked_medium": unlocked_medium,
             "unlocked_hard": unlocked_hard,
             "unlocked_next_lesson": unlocked_next_lesson,
@@ -1881,6 +1994,167 @@ def delete_kc(kc_name: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Admin User Management Endpoints ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/admin/users")
+def get_admin_users():
+    """Returns list of users with roles for Admin dashboard."""
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """SELECT id, name, username, COALESCE(role, 'student') as role,
+                      COALESCE(plain_password, 'Not available (Legacy user)') as password,
+                      created_at
+               FROM users
+               ORDER BY CASE WHEN role = 'admin' THEN 1 WHEN role = 'teacher' THEN 2 ELSE 3 END, username ASC"""
+        )
+        users = [dict(u) for u in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return users
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/users/create-teacher")
+def create_teacher(req: CreateTeacherRequest):
+    """Admin creates a verified Teacher account."""
+    if not req.name.strip() or not req.username.strip() or not req.password.strip():
+        raise HTTPException(status_code=400, detail="All fields are required.")
+    hashed = pwd_context.hash(req.password.strip())
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "INSERT INTO users (name, username, password_hash, role, plain_password) VALUES (%s, %s, %s, 'teacher', %s) RETURNING id, name, username, role, plain_password as password, created_at",
+            (req.name.strip(), req.username.strip().lower(), hashed, req.password.strip())
+        )
+        new_teacher = dict(cur.fetchone())
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"success": True, "user": new_teacher}
+    except psycopg2.errors.UniqueViolation:
+        raise HTTPException(status_code=409, detail="Username already exists.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/admin/users/{user_id}/role")
+def update_user_role(user_id: int, req: UpdateUserRoleRequest):
+    """Admin updates a user's role (admin, teacher, student)."""
+    if req.role not in ('admin', 'teacher', 'student'):
+        raise HTTPException(status_code=400, detail="Role must be admin, teacher, or student.")
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET role = %s WHERE id = %s", (req.role, user_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"success": True, "user_id": user_id, "role": req.role}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/admin/users/{user_id}/password")
+def admin_reset_user_password(user_id: int, req: AdminResetPasswordRequest):
+    """Admin resets or sets a user's password directly."""
+    if not req.password.strip():
+        raise HTTPException(status_code=400, detail="Password cannot be empty.")
+    hashed = pwd_context.hash(req.password.strip())
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET password_hash = %s, plain_password = %s WHERE id = %s",
+            (hashed, req.password.strip(), user_id)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"success": True, "user_id": user_id, "new_password": req.password.strip()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/users/{user_id}/delete")
+@app.delete("/admin/users/{user_id}")
+def admin_delete_user(user_id: int, req: AdminDeleteUserRequest):
+    """Admin permanently deletes a user account after verifying admin password."""
+    admin_pwd = (req.admin_password or "").strip()
+    if not admin_pwd:
+        raise HTTPException(status_code=400, detail="Administrator password is required.")
+
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        # 1. Verify administrator credentials
+        cur.execute("SELECT id, username, password_hash, plain_password FROM users WHERE role = 'admin'")
+        admin_rows = cur.fetchall()
+        if not admin_rows:
+            raise HTTPException(status_code=500, detail="No administrator account found in system.")
+
+        matched_admin = None
+        for a in admin_rows:
+            if req.admin_id and a["id"] != req.admin_id:
+                continue
+            # Check plain password or hash
+            if a.get("plain_password") == admin_pwd or pwd_context.verify(admin_pwd, a["password_hash"]):
+                matched_admin = a
+                break
+
+        if not matched_admin:
+            raise HTTPException(status_code=401, detail="Invalid administrator password. Account deletion unauthorized.")
+
+        # 2. Check target user
+        cur.execute("SELECT id, username, role FROM users WHERE id = %s", (user_id,))
+        target_user = cur.fetchone()
+        if not target_user:
+            raise HTTPException(status_code=404, detail="User not found.")
+
+        if target_user["username"] == "admin":
+            raise HTTPException(status_code=403, detail="The root administrator account cannot be deleted.")
+
+        if target_user["id"] == matched_admin["id"]:
+            raise HTTPException(status_code=403, detail="You cannot delete your own active administrator account.")
+
+        # 3. Clean up associated student/user records
+        cur.execute("SELECT id FROM student_quiz_attempts WHERE user_id = %s", (user_id,))
+        attempt_rows = cur.fetchall()
+        attempt_ids = [r["id"] for r in attempt_rows]
+        if attempt_ids:
+            cur.execute("DELETE FROM student_question_answers WHERE attempt_id = ANY(%s)", (attempt_ids,))
+
+        cur.execute("DELETE FROM student_quiz_attempts WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM student_lesson_progress WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM student_profiles WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM student_kc_mastery WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM student_streaks WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM daily_quiz_slots WHERE user_id = %s", (user_id,))
+        cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
+
+        conn.commit()
+        return {
+            "success": True,
+            "deleted_user_id": user_id,
+            "username": target_user["username"],
+            "message": f"User @{target_user['username']} and all associated records deleted successfully."
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
 @app.get("/student/{user_id}/kc-mastery")
 def get_student_kc_mastery(user_id: int, topic_id: Optional[str] = None):
     """
@@ -2163,36 +2437,189 @@ def repair_streak(user_id: int):
 # ── Phase 3: Hint Endpoint ────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
+SERVER_KC_SCAFFOLDING = {
+    "setting": {
+        "en": "Setting requires a location (WHERE) or time (WHEN). This choice does not tell where or when the story happened.",
+        "asl": "SETTING MUST BE PLACE OR TIME. THIS CHOICE NOT PLACE/TIME."
+    },
+    "character": {
+        "en": "A character must be a person or animal who takes action in the story. This choice is not an actor.",
+        "asl": "CHARACTER MUST BE PERSON OR ANIMAL. THIS CHOICE NOT ACTOR."
+    },
+    "characters": {
+        "en": "Characters must be people or animals who take action in the story. This choice is not an actor.",
+        "asl": "CHARACTERS MUST BE PEOPLE OR ANIMALS. THIS CHOICE NOT ACTOR."
+    },
+    "initiating_event": {
+        "en": "The initiating event is the problem or trouble that starts the story. This choice is not the conflict.",
+        "asl": "INITIATING EVENT MEAN TROUBLE START STORY. THIS CHOICE NOT TROUBLE."
+    },
+    "problem": {
+        "en": "A problem is the conflict or trouble in the story. This choice does not describe what went wrong.",
+        "asl": "PROBLEM MEAN TROUBLE / CONFLICT. THIS CHOICE NOT TROUBLE."
+    },
+    "attempt": {
+        "en": "An attempt is what the character does to try to fix the problem. This choice is not an action step.",
+        "asl": "ATTEMPT MEAN ACTION TO FIX PROBLEM. THIS CHOICE NOT ACTION."
+    },
+    "action": {
+        "en": "An action describes what the character does. This choice does not describe an action step.",
+        "asl": "ACTION MEAN CHARACTER DO SOMETHING. THIS CHOICE NOT ACTION."
+    },
+    "internal_response": {
+        "en": "An internal response describes feelings or thoughts. This choice is not an emotion or thought.",
+        "asl": "INTERNAL RESPONSE MEAN FEELING OR THOUGHT. THIS CHOICE NOT FEELING."
+    },
+    "emotion": {
+        "en": "This question asks for an emotion. This choice does not describe how the character feels.",
+        "asl": "QUESTION ASK EMOTION. THIS CHOICE NOT FEELING."
+    },
+    "consequence": {
+        "en": "A consequence shows the outcome or ending. This choice does not show how the story finished.",
+        "asl": "CONSEQUENCE MEAN OUTCOME / ENDING. THIS CHOICE NOT RESULT."
+    },
+    "resolution": {
+        "en": "A resolution describes how the problem was solved. This choice does not show the fix or outcome.",
+        "asl": "RESOLUTION SHOW PROBLEM FIXED. THIS CHOICE NOT SHOW FIX."
+    },
+    "reaction": {
+        "en": "A reaction shows the final reflection or lesson learned. This choice is not a final reaction.",
+        "asl": "REACTION MEAN FINAL FEELING OR LESSON. THIS CHOICE NOT REACTION."
+    },
+    "vocabulary": {
+        "en": "This question asks for the meaning of a key word. This choice does not fit the sentence context.",
+        "asl": "QUESTION ASK WORD MEANING. THIS CHOICE NOT FIT CONTEXT."
+    }
+}
+
 class HintRequest(BaseModel):
     user_id: int
-    question_id: int
+    question_id: Optional[int] = None
+    attempt_id: Optional[int] = None
     topic_id: Optional[str] = None
 
 @app.post("/quiz/session/use-hint")
 def use_hint(req: HintRequest):
-    """Deducts 5 stars and returns a hint for the given question."""
+    """
+    Hybrid 2-Tier Hint Scaffolding:
+    Deducts 5 stars, selects one distractor to eliminate, and returns:
+    - Tier 1: Teacher custom hint (if authored in Admin panel)
+    - Tier 2: Automated KC Criterion-Referenced Invalidation (English + ASL Gloss)
+    """
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         total_stars = _get_total_stars(cur, req.user_id)
         if total_stars < 5:
             raise HTTPException(status_code=400, detail="Not enough stars. Need 5 stars to use a hint.")
+
+        target_q_id = req.question_id
+        if not target_q_id and req.attempt_id:
+            cur.execute("SELECT question_ids FROM student_quiz_attempts WHERE id = %s", (req.attempt_id,))
+            att = cur.fetchone()
+            if att and att.get("question_ids") and len(att["question_ids"]) > 0:
+                target_q_id = att["question_ids"][0]
+
+        if not target_q_id:
+            raise HTTPException(status_code=400, detail="question_id is required.")
+
         cur.execute(
-            "SELECT question_text, correct_option_letter, question_type FROM questions WHERE id = %s",
-            (req.question_id,)
+            """SELECT id, question_text, correct_option_letter, question_type, 
+                      knowledge_component, hint 
+               FROM questions WHERE id = %s""",
+            (target_q_id,)
         )
         q = cur.fetchone()
         if not q:
             raise HTTPException(status_code=404, detail="Question not found.")
+
         _deduct_stars(cur, req.user_id, 5, req.topic_id)
         conn.commit()
-        if q["question_type"] == "matching":
-            hint_text = "Look for matching pairs by focusing on similar categories."
+
+        # Fetch options to select a distractor
+        cur.execute(
+            "SELECT option_letter, option_text FROM question_options WHERE question_id = %s ORDER BY option_letter ASC",
+            (target_q_id,)
+        )
+        opts = cur.fetchall()
+
+        correct_letter = (q.get("correct_option_letter") or "A").upper()
+        wrong_opts = [o for o in opts if o["option_letter"].upper() != correct_letter]
+
+        eliminated_opt = None
+        eliminated_idx = None
+        if wrong_opts:
+            import random
+            eliminated_opt = random.choice(wrong_opts)
+            for idx, o in enumerate(opts):
+                if o["option_letter"] == eliminated_opt["option_letter"]:
+                    eliminated_idx = idx
+                    break
+
+        # Tier 1: Teacher custom hint
+        teacher_hint = (q.get("hint") or "").strip()
+        has_custom_hint = bool(teacher_hint and not teacher_hint.startswith("Think carefully") and not teacher_hint.startswith("Look closely"))
+
+        # Tier 2: Automated KC Scaffolding with prefix stripping and question awareness
+        raw_kc = (q.get("knowledge_component") or "general").lower().replace("kc_story_", "").replace("kc_", "").replace(" ", "_").replace("-", "_")
+        q_text = (q.get("question_text") or "").strip()
+        q_lower = q_text.lower()
+        opt_text = (eliminated_opt["option_text"] if eliminated_opt else "").strip()
+        opt_lower = opt_text.lower()
+
+        # Extract subject from question
+        import re
+        subj_match = re.search(r'(?:does|did|is|was|will)\s+([A-Z][a-z]+)', q_text)
+        subject = subj_match.group(1) if subj_match else "the character"
+
+        if has_custom_hint:
+            reason_en = teacher_hint
+            reason_asl = teacher_hint.upper()
+            tier = 1
+        elif raw_kc == "setting" or q_lower.startswith("where") or q_lower.startswith("when"):
+            is_place = any(opt_lower.startswith(p) for p in ["in ", "at ", "on ", "under ", "inside ", "behind "])
+            if is_place:
+                reason_en = f"In the story, {subject} does not start or play '{opt_text}'. Look for where the adventure actually began."
+                reason_asl = f"{subject.upper()} NOT AT '{opt_text.upper()}' IN STORY. LOOK WHERE STORY BEGINS."
+            else:
+                reason_en = f"Setting requires a location (WHERE) or time (WHEN). '{opt_text}' does not tell where or when."
+                reason_asl = f"SETTING MEAN PLACE OR TIME. '{opt_text.upper()}' NOT PLACE."
+            tier = 2
+        elif raw_kc in ["character", "characters"] or q_lower.startswith("who"):
+            reason_en = f"In the story, '{opt_text}' is not the character who did this. Look for who took action."
+            reason_asl = f"'{opt_text.upper()}' NOT THE CHARACTER. LOOK WHO DO ACTION."
+            tier = 2
+        elif raw_kc in ["initiating_event", "problem"] or "problem" in q_lower or "trouble" in q_lower:
+            reason_en = f"'{opt_text}' was not the conflict or problem that started the trouble in the story."
+            reason_asl = f"'{opt_text.upper()}' NOT THE TROUBLE IN STORY."
+            tier = 2
+        elif raw_kc in ["resolution", "consequence"] or "end" in q_lower or "solve" in q_lower:
+            reason_en = f"'{opt_text}' is not how the story ended or how the problem was resolved."
+            reason_asl = f"'{opt_text.upper()}' NOT HOW STORY END OR FIX."
+            tier = 2
         else:
-            hint_text = f"The correct answer starts with option {q['correct_option_letter']}."
+            kc_scaffold = SERVER_KC_SCAFFOLDING.get(raw_kc, {
+                "en": f"In the story, '{opt_text}' does not match what the question is asking.",
+                "asl": f"CHOICE '{opt_text.upper()}' NOT FIT STORY."
+            })
+            reason_en = f"Eliminated: {kc_scaffold['en']}"
+            reason_asl = kc_scaffold["asl"]
+            tier = 2
+
         cur.close()
         conn.close()
-        return {"success": True, "hint": hint_text, "stars_spent": 5}
+
+        return {
+            "success": True,
+            "stars_spent": 5,
+            "hint": reason_en,
+            "reason_en": reason_en,
+            "reason_asl": reason_asl,
+            "tier": tier,
+            "eliminated_option_letter": eliminated_opt["option_letter"] if eliminated_opt else None,
+            "eliminated_option_idx": eliminated_idx,
+            "eliminated_option_text": eliminated_opt["option_text"] if eliminated_opt else None,
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -2579,7 +3006,7 @@ def change_student_password(user_id: int, req: ChangePasswordRequest):
         if not u or not pwd_context.verify(req.old_password, u["password_hash"]):
             raise HTTPException(status_code=401, detail="Incorrect current password.")
         new_hashed = pwd_context.hash(req.new_password.strip())
-        cur.execute("UPDATE users SET password_hash = %s WHERE id = %s", (new_hashed, user_id))
+        cur.execute("UPDATE users SET password_hash = %s, plain_password = %s WHERE id = %s", (new_hashed, req.new_password.strip(), user_id))
         conn.commit()
         cur.close()
         conn.close()

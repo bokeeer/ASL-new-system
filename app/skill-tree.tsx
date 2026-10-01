@@ -7,12 +7,17 @@ import { Ionicons } from '@expo/vector-icons';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useAuth } from '../context/AuthContext';
 import { API_URL } from '../context/config';
+import {
+  cacheKCMasteryList,
+  getCachedKCMasteryList,
+  getAllLocalKCMastery,
+} from '../context/OfflineCache';
 
-const STATUS_CONFIG: Record<string, { color: string; bg: string; icon: string; label: string; bar: string }> = {
-  mastered:    { color: '#10B981', bg: '#DCFCE7', icon: '⭐', label: 'Mastered',     bar: '#10B981' },
-  learning:    { color: '#F59E0B', bg: '#FEF3C7', icon: '📖', label: 'Learning',     bar: '#F59E0B' },
-  struggling:  { color: '#EF4444', bg: '#FEE2E2', icon: '🔥', label: 'Needs Work',   bar: '#EF4444' },
-  not_started: { color: '#9CA3AF', bg: '#F3F4F6', icon: '○',  label: 'Not Started',  bar: '#D1D5DB' },
+const STATUS_CONFIG: Record<string, { color: string; bg: string; icon: keyof typeof Ionicons.glyphMap; label: string; bar: string }> = {
+  mastered:    { color: '#10B981', bg: '#DCFCE7', icon: 'star', label: 'Mastered', bar: '#10B981' },
+  learning:    { color: '#F59E0B', bg: '#FEF3C7', icon: 'book-outline', label: 'Learning', bar: '#F59E0B' },
+  struggling:  { color: '#EF4444', bg: '#FEE2E2', icon: 'alert-circle-outline', label: 'Needs Work', bar: '#EF4444' },
+  not_started: { color: '#9CA3AF', bg: '#F3F4F6', icon: 'radio-button-off-outline', label: 'Not Started', bar: '#D1D5DB' },
 };
 
 interface KCMastery {
@@ -70,9 +75,72 @@ export default function SkillTreeScreen() {
         ? `${API_URL}/student/${user.id}/kc-mastery?topic_id=${topicId}`
         : `${API_URL}/student/${user.id}/kc-mastery`;
       const res = await fetch(url);
-      if (res.ok) setData(await res.json());
-    } catch { /* silent */ }
-    finally { setLoading(false); }
+      if (res.ok) {
+        const json = await res.json();
+        const localUpdates = await getAllLocalKCMastery(user.id);
+        const mergedKcs = (json.kc_mastery || []).map((kc: KCMastery) => {
+          const local = localUpdates[kc.kc_name];
+          if (local) {
+            return {
+              ...kc,
+              p_mastery: local.p_mastery,
+              p_mastery_pct: local.p_mastery_pct,
+              status: local.status,
+              correct_count: Math.max(kc.correct_count, local.correct_count),
+              wrong_count: Math.max(kc.wrong_count, local.wrong_count),
+              total_opportunities: Math.max(kc.total_opportunities, local.total_opportunities),
+            };
+          }
+          return kc;
+        });
+
+        const mergedData: MasteryData = {
+          ...json,
+          kc_mastery: mergedKcs,
+          mastered: mergedKcs.filter((k: any) => k.status === 'mastered').length,
+          learning: mergedKcs.filter((k: any) => k.status === 'learning').length,
+          struggling: mergedKcs.filter((k: any) => k.status === 'struggling').length,
+          not_started: mergedKcs.filter((k: any) => k.status === 'not_started').length,
+        };
+
+        setData(mergedData);
+        await cacheKCMasteryList(user.id, mergedData);
+        return;
+      }
+      throw new Error('Network response not ok');
+    } catch {
+      // Offline fallback: load cached mastery and merge local BKT updates
+      const cached = await getCachedKCMasteryList(user.id);
+      const localUpdates = await getAllLocalKCMastery(user.id);
+      if (cached?.kc_mastery) {
+        const mergedKcs = cached.kc_mastery.map((kc: KCMastery) => {
+          const local = localUpdates[kc.kc_name];
+          if (local) {
+            return {
+              ...kc,
+              p_mastery: local.p_mastery,
+              p_mastery_pct: local.p_mastery_pct,
+              status: local.status,
+              correct_count: Math.max(kc.correct_count, local.correct_count),
+              wrong_count: Math.max(kc.wrong_count, local.wrong_count),
+              total_opportunities: Math.max(kc.total_opportunities, local.total_opportunities),
+            };
+          }
+          return kc;
+        });
+
+        setData({
+          ...cached,
+          kc_mastery: mergedKcs,
+          mastered: mergedKcs.filter((k: any) => k.status === 'mastered').length,
+          learning: mergedKcs.filter((k: any) => k.status === 'learning').length,
+          struggling: mergedKcs.filter((k: any) => k.status === 'struggling').length,
+          not_started: mergedKcs.filter((k: any) => k.status === 'not_started').length,
+        });
+      }
+    } finally {
+      setLoading(false);
+    }
   };
 
   const filtered = (data?.kc_mastery ?? []).filter(k => filter === 'all' || k.status === filter);
@@ -89,8 +157,8 @@ export default function SkillTreeScreen() {
           <Ionicons name="arrow-back" size={22} color="#1F2937" />
         </TouchableOpacity>
         <View style={{ flex: 1 }}>
-          <Text style={styles.headerTitle}>🧠 Skill Tree</Text>
-          <Text style={styles.headerSub}>Your knowledge mastery map (AI-powered)</Text>
+          <Text style={styles.headerTitle}>Skill Tree</Text>
+          <Text style={styles.headerSub}>Knowledge mastery map (BKT-powered)</Text>
         </View>
         <TouchableOpacity onPress={fetchMastery} style={styles.refreshIconBtn}>
           <Ionicons name="refresh" size={20} color="#7C3AED" />
@@ -104,7 +172,7 @@ export default function SkillTreeScreen() {
         </View>
       ) : !data || data.total_kcs === 0 ? (
         <View style={styles.center}>
-          <Text style={{ fontSize: 56 }}>🌱</Text>
+          <Ionicons name="leaf-outline" size={56} color="#10B981" />
           <Text style={styles.emptyTitle}>No skills tracked yet</Text>
           <Text style={styles.emptyBody}>
             Answer quiz questions that are tagged with Knowledge Components to start tracking your skill mastery here.
@@ -119,13 +187,13 @@ export default function SkillTreeScreen() {
           {/* Summary Cards */}
           <View style={styles.summaryRow}>
             {[
-              { label: 'Mastered',    count: data.mastered,    color: '#10B981', bg: '#DCFCE7', icon: '⭐' },
-              { label: 'Learning',    count: data.learning,    color: '#F59E0B', bg: '#FEF3C7', icon: '📖' },
-              { label: 'Struggling',  count: data.struggling,  color: '#EF4444', bg: '#FEE2E2', icon: '🔥' },
-              { label: 'Not Started', count: data.not_started, color: '#9CA3AF', bg: '#F3F4F6', icon: '○' },
+              { label: 'Mastered',    count: data.mastered,    color: '#10B981', bg: '#DCFCE7', icon: 'star' as const },
+              { label: 'Learning',    count: data.learning,    color: '#F59E0B', bg: '#FEF3C7', icon: 'book-outline' as const },
+              { label: 'Struggling',  count: data.struggling,  color: '#EF4444', bg: '#FEE2E2', icon: 'alert-circle-outline' as const },
+              { label: 'Not Started', count: data.not_started, color: '#9CA3AF', bg: '#F3F4F6', icon: 'radio-button-off-outline' as const },
             ].map(s => (
               <View key={s.label} style={[styles.summaryCard, { backgroundColor: s.bg }]}>
-                <Text style={{ fontSize: 20 }}>{s.icon}</Text>
+                <Ionicons name={s.icon} size={20} color={s.color} />
                 <Text style={[styles.summaryCount, { color: s.color }]}>{s.count}</Text>
                 <Text style={styles.summaryLabel}>{s.label}</Text>
               </View>
@@ -155,10 +223,10 @@ export default function SkillTreeScreen() {
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.filterRow}>
             {([
               ['all',         `All (${data.total_kcs})`],
-              ['mastered',    `⭐ Mastered (${data.mastered})`],
-              ['learning',    `📖 Learning (${data.learning})`],
-              ['struggling',  `🔥 Struggling (${data.struggling})`],
-              ['not_started', `○ Not Started (${data.not_started})`],
+              ['mastered',    `Mastered (${data.mastered})`],
+              ['learning',    `Learning (${data.learning})`],
+              ['struggling',  `Needs Work (${data.struggling})`],
+              ['not_started', `Not Started (${data.not_started})`],
             ] as [FilterType, string][]).map(([f, label]) => (
               <TouchableOpacity
                 key={f}
@@ -183,7 +251,7 @@ export default function SkillTreeScreen() {
                 <View style={styles.kcTop}>
                   <View style={{ flex: 1 }}>
                     <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-                      <Text style={{ fontSize: 20 }}>{cfg.icon}</Text>
+                      <Ionicons name={cfg.icon} size={20} color={cfg.color} />
                       <Text style={styles.kcName}>{kc.display_name}</Text>
                     </View>
                     <Text style={styles.kcId}>{kc.kc_name}</Text>
@@ -220,23 +288,26 @@ export default function SkillTreeScreen() {
 
                 {/* Context hints */}
                 {kc.status === 'struggling' && (
-                  <View style={styles.hintBox}>
-                    <Text style={styles.hintText}>
-                      💡 The AI will prioritise questions from this skill in your next quiz session.
+                  <View style={[styles.hintBox, { flexDirection: 'row', alignItems: 'center', gap: 6 }]}>
+                    <Ionicons name="information-circle-outline" size={16} color="#4338CA" />
+                    <Text style={[styles.hintText, { flex: 1 }]}>
+                      The AI will prioritise questions from this skill in your next quiz session.
                     </Text>
                   </View>
                 )}
                 {kc.status === 'learning' && kc.total_opportunities > 0 && (
-                  <View style={[styles.hintBox, { backgroundColor: '#FEF3C7' }]}>
-                    <Text style={[styles.hintText, { color: '#92400E' }]}>
-                      📈 You're making progress! Keep answering to build mastery.
+                  <View style={[styles.hintBox, { backgroundColor: '#FEF3C7', flexDirection: 'row', alignItems: 'center', gap: 6 }]}>
+                    <Ionicons name="trending-up-outline" size={16} color="#92400E" />
+                    <Text style={[styles.hintText, { color: '#92400E', flex: 1 }]}>
+                      You are making progress. Keep answering to build mastery.
                     </Text>
                   </View>
                 )}
                 {kc.status === 'mastered' && (
-                  <View style={[styles.hintBox, { backgroundColor: '#DCFCE7' }]}>
-                    <Text style={[styles.hintText, { color: '#065F46' }]}>
-                      🎉 Great work! You've mastered this skill.
+                  <View style={[styles.hintBox, { backgroundColor: '#DCFCE7', flexDirection: 'row', alignItems: 'center', gap: 6 }]}>
+                    <Ionicons name="ribbon-outline" size={16} color="#065F46" />
+                    <Text style={[styles.hintText, { color: '#065F46', flex: 1 }]}>
+                      Great work. You have mastered this skill.
                     </Text>
                   </View>
                 )}

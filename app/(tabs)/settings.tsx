@@ -136,9 +136,6 @@ export default function SettingsScreen() {
       <ScrollView contentContainerStyle={styles.container}>
         {/* Header */}
         <View style={styles.header}>
-          <TouchableOpacity style={styles.backButton} onPress={() => router.back()}>
-            <Ionicons name="arrow-back" size={24} color="#0284C7" />
-          </TouchableOpacity>
           <Text style={styles.headerTitle}>Settings</Text>
         </View>
 

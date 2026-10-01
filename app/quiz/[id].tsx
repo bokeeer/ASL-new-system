@@ -11,7 +11,13 @@ import {
   cacheQuizSession,
   getCachedQuizSession,
   enqueuePendingQuiz,
+  updateLocalKCMastery,
+  StudentKCMastery,
 } from "../../context/OfflineCache";
+import {
+  getEliminationScaffold,
+  getWrongAnswerScaffold,
+} from "../../context/kcScaffolding";
 
 const { width } = Dimensions.get('window');
 
@@ -76,6 +82,7 @@ export default function QuizScreen() {
     unlocked_hard: boolean;
     unlocked_next_lesson: boolean;
   } | null>(null);
+  const [bktMasteryResult, setBktMasteryResult] = useState<StudentKCMastery | null>(null);
 
   // Timers for tracking time spent per question
   const questionStartTimeRef = useRef<number>(Date.now());
@@ -99,12 +106,48 @@ export default function QuizScreen() {
   const [hintLoading, setHintLoading] = useState(false);
   const [hintUsed, setHintUsed] = useState(false);
   const [eliminatedOptionIdx, setEliminatedOptionIdx] = useState<number | null>(null);
+  const [eliminatedOptionInfo, setEliminatedOptionInfo] = useState<{
+    index: number;
+    optionText: string;
+    reasonEn: string;
+    reasonAsl: string;
+  } | null>(null);
+
+  // Wrong Answer Review Modal State
+  const [wrongFeedbackVisible, setWrongFeedbackVisible] = useState(false);
+  const [wrongFeedbackData, setWrongFeedbackData] = useState<{
+    selectedText: string;
+    correctText: string;
+    reasonEn: string;
+    reasonAsl: string;
+    kcDisplayName: string;
+    pendingScore: number;
+    pendingAnswers: QuestionAnswerRecord[];
+  } | null>(null);
 
   // Visual Feedback Animations (Auditory-Free)
   const shakeAnim = useRef(new Animated.Value(0)).current;
-  const starPopAnim = useRef(new Animated.Value(0)).current;
   const hintElimAnim = useRef(new Animated.Value(0)).current;
-  const [showStarPop, setShowStarPop] = useState(false);
+
+  // Praise Pop Animation (Randomized encouraging feedback on correct answers)
+  const PRAISE_MESSAGES = ["Correct!", "Very Well!", "Great!", "Awesome!", "Well Done!", "Excellent!", "Good Job!", "Nice Work!"];
+  const [praiseText, setPraiseText] = useState("Correct!");
+  const [showPraisePop, setShowPraisePop] = useState(false);
+  const praisePopAnim = useRef(new Animated.Value(0)).current;
+
+  const triggerPraisePop = () => {
+    const randomPraise = PRAISE_MESSAGES[Math.floor(Math.random() * PRAISE_MESSAGES.length)];
+    setPraiseText(randomPraise);
+    setShowPraisePop(true);
+    praisePopAnim.setValue(0);
+    Animated.timing(praisePopAnim, {
+      toValue: 1,
+      duration: 1200,
+      useNativeDriver: Platform.OS !== 'web',
+    }).start(() => {
+      setShowPraisePop(false);
+    });
+  };
 
   const triggerShake = () => {
     shakeAnim.setValue(0);
@@ -117,63 +160,111 @@ export default function QuizScreen() {
     ]).start();
   };
 
-  const triggerStarPop = () => {
-    setShowStarPop(true);
-    starPopAnim.setValue(0);
-    Animated.timing(starPopAnim, {
-      toValue: 1,
-      duration: 800,
-      useNativeDriver: Platform.OS !== 'web',
-    }).start(() => {
-      setShowStarPop(false);
-    });
-  };
-
   const handleUseHint = async () => {
-    if (!attemptId) {
+    if (!attemptId && !quizQuestions.length) {
       Alert.alert('Not available', 'Quiz session is not started yet.');
       return;
     }
     if (hintUsed) return;
     setHintLoading(true);
+
+    const currentQ = quizQuestions[currentQuestionIndex];
+    if (!currentQ) {
+      setHintLoading(false);
+      return;
+    }
+
     try {
-      const res = await fetch(`${API_URL}/quiz/session/use-hint`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ attempt_id: attemptId, user_id: userId }),
-      });
-      if (res.status === 400) {
-        const data = await res.json();
-        Alert.alert('Not enough stars', data.detail || 'You need at least 5 stars to use a hint.');
-        return;
+      let serverData: any = null;
+      try {
+        const res = await fetch(`${API_URL}/quiz/session/use-hint`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            attempt_id: attemptId, 
+            question_id: currentQ.id, 
+            user_id: userId 
+          }),
+        });
+        if (res.status === 400) {
+          const errData = await res.json();
+          Alert.alert('Not enough stars', errData.detail || 'You need at least 5 stars to use a hint.');
+          setHintLoading(false);
+          return;
+        }
+        if (res.ok) {
+          serverData = await res.json();
+        }
+      } catch (networkErr) {
+        console.log('Using local offline hint scaffolding:', networkErr);
       }
-      const data = await res.json();
-      const currentQ = quizQuestions[currentQuestionIndex];
-      const hint = currentQ?.hint || 'Think carefully about the question context.';
-      setHintText(hint);
+
       setHintUsed(true);
 
-      // Visual elimination of 1 wrong choice for multiple choice
-      if (currentQ && currentQ.question_type !== 'matching' && currentQ.options && currentQ.options.length > 2) {
-        const wrongIndices = currentQ.options
-          .map((_: any, i: number) => i)
-          .filter((i: number) => i !== currentQ.correctOptionIndex);
-        if (wrongIndices.length > 0) {
-          const randomWrong = wrongIndices[Math.floor(Math.random() * wrongIndices.length)];
-          setEliminatedOptionIdx(randomWrong);
+      // Multiple choice elimination
+      if (currentQ.question_type !== 'matching' && currentQ.options && currentQ.options.length > 2) {
+        let wrongIdx = -1;
+        let wrongOptText = '';
+
+        if (serverData?.eliminated_option_idx !== undefined && serverData.eliminated_option_idx !== null && serverData.eliminated_option_idx >= 0) {
+          wrongIdx = serverData.eliminated_option_idx;
+          wrongOptText = currentQ.options[wrongIdx]?.text || serverData.eliminated_option_text || '';
+        } else {
+          // Local fallback selection
+          const wrongIndices = currentQ.options
+            .map((_: any, i: number) => i)
+            .filter((i: number) => i !== currentQ.correctOptionIndex && currentQ.options[i].id !== currentQ.correctOptionId);
+          if (wrongIndices.length > 0) {
+            wrongIdx = wrongIndices[Math.floor(Math.random() * wrongIndices.length)];
+            wrongOptText = currentQ.options[wrongIdx]?.text || '';
+          }
+        }
+
+        if (wrongIdx >= 0) {
+          setEliminatedOptionIdx(wrongIdx);
+
+          // Get Hybrid 2-Tier Scaffolding
+          const scaffold = getEliminationScaffold(
+            currentQ.knowledge_component,
+            wrongOptText,
+            currentQ.hint,
+            currentQ.question || currentQ.question_text
+          );
+
+          const finalReasonEn = serverData?.reason_en || scaffold.reasonEn;
+          const finalReasonAsl = serverData?.reason_asl || scaffold.reasonAsl;
+
+          setEliminatedOptionInfo({
+            index: wrongIdx,
+            optionText: wrongOptText,
+            reasonEn: finalReasonEn,
+            reasonAsl: finalReasonAsl,
+          });
+
+          setHintText(finalReasonEn);
+
           hintElimAnim.setValue(0);
           Animated.timing(hintElimAnim, {
             toValue: 1,
             duration: 450,
             useNativeDriver: false,
           }).start();
+
           try {
             Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium).catch(() => {});
           } catch {}
         }
+      } else {
+        const scaffold = getEliminationScaffold(
+          currentQ.knowledge_component,
+          '',
+          currentQ.hint,
+          currentQ.question || currentQ.question_text
+        );
+        setHintText(serverData?.hint || scaffold.reasonEn);
       }
     } catch {
-      Alert.alert('Error', 'Could not fetch hint. Check your connection.');
+      Alert.alert('Error', 'Could not process hint request.');
     } finally {
       setHintLoading(false);
     }
@@ -231,6 +322,7 @@ export default function QuizScreen() {
     setCurrentQuestionIndex(0);
     setAnswersRecord([]);
     setCompletionResult(null);
+    setBktMasteryResult(null);
     setIsOfflineSaved(false);
     totalQuizStartTimeRef.current = Date.now();
 
@@ -290,8 +382,9 @@ export default function QuizScreen() {
           left: p.left || p.left_item || '',
           right: p.right || p.right_item || ''
         })),
-        hint: "Look closely at the choice text.",
-        deafHint: "LOOK CLOSELY AT THE CHOICE TEXT."
+        hint: q.hint || "",
+        deafHint: (q.hint || "").toUpperCase(),
+        knowledge_component: q.knowledge_component || 'reading_comprehension',
       }));
 
       setQuizQuestions(mapped);
@@ -324,8 +417,9 @@ export default function QuizScreen() {
               left: p.left || p.left_item || '',
               right: p.right || p.right_item || ''
             })),
-            hint: "Look closely at the choice text.",
-            deafHint: "LOOK CLOSELY AT THE CHOICE TEXT."
+            hint: q.hint || "",
+            deafHint: (q.hint || "").toUpperCase(),
+            knowledge_component: q.knowledge_component || 'reading_comprehension',
           }));
           setQuizQuestions(mapped);
           setQuizTitle(`${(cachedSession.difficulty || 'QUIZ').toUpperCase()} Quiz (Offline)`);
@@ -406,6 +500,17 @@ export default function QuizScreen() {
           const result = await res.json();
           setCompletionResult(result);
           setIsOfflineSaved(false);
+
+          // Update local BKT mastery cache
+          let latestKCMastery: StudentKCMastery | null = null;
+          for (const ans of finalAnswers) {
+            const qObj = quizQuestions.find(q => q.id === ans.question_id);
+            const kc = qObj?.knowledge_component || 'reading_comprehension';
+            latestKCMastery = await updateLocalKCMastery(userId, kc, ans.is_correct);
+          }
+          if (latestKCMastery) {
+            setBktMasteryResult(latestKCMastery);
+          }
           return;
         }
       }
@@ -425,8 +530,20 @@ export default function QuizScreen() {
       });
 
       setIsOfflineSaved(true);
-      const starsMap: Record<string, number> = { easy: 10, medium: 20, hard: 30 };
-      const starsEarned = isPassed ? (starsMap[difficulty] || 10) : 0;
+      const starRates: Record<string, number> = { easy: 3, medium: 4, hard: 6 };
+      const starRate = starRates[(difficulty || 'easy').toLowerCase()] || 3;
+      const starsEarned = isPassed ? (finalScore * starRate) : 0;
+
+      // Real-time edge BKT update while offline
+      let latestKCMastery: StudentKCMastery | null = null;
+      for (const ans of finalAnswers) {
+        const qObj = quizQuestions.find(q => q.id === ans.question_id);
+        const kc = qObj?.knowledge_component || 'reading_comprehension';
+        latestKCMastery = await updateLocalKCMastery(userId, kc, ans.is_correct);
+      }
+      if (latestKCMastery) {
+        setBktMasteryResult(latestKCMastery);
+      }
 
       // Optimistic completion result so visual celebrations and unlocks function smoothly
       setCompletionResult({
@@ -456,7 +573,7 @@ export default function QuizScreen() {
     if (isCorrect) {
       newScore = score + 1;
       setScore(newScore);
-      triggerStarPop();
+      triggerPraisePop();
       try {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       } catch {}
@@ -475,21 +592,76 @@ export default function QuizScreen() {
     const updatedAnswers = [...answersRecord, newAnswer];
     setAnswersRecord(updatedAnswers);
 
-    // Auto-advance after 1.2 seconds
-    setTimeout(() => {
-      setShowStarPop(false);
-      shakeAnim.setValue(0);
-      starPopAnim.setValue(0);
-      if (currentQuestionIndex < quizQuestions.length - 1) {
-        setCurrentQuestionIndex(prev => prev + 1);
-        setSelectedOptionIndex(null);
-        setIsAnswered(false);
-        setShowHint(false);
-      } else {
-        setIsFinished(true);
-        submitQuizResults(newScore, updatedAnswers);
-      }
-    }, 1200);
+    if (isCorrect) {
+      // Auto-advance after 2.0 seconds for correct answers
+      setTimeout(() => {
+        setShowPraisePop(false);
+        shakeAnim.setValue(0);
+        setEliminatedOptionIdx(null);
+        setEliminatedOptionInfo(null);
+        setHintText(null);
+        setHintUsed(false);
+        if (currentQuestionIndex < quizQuestions.length - 1) {
+          setCurrentQuestionIndex(prev => prev + 1);
+          setSelectedOptionIndex(null);
+          setIsAnswered(false);
+          setShowHint(false);
+        } else {
+          setIsFinished(true);
+          submitQuizResults(newScore, updatedAnswers);
+        }
+      }, 2000);
+    } else {
+      // Wrong Answer Scaffolding: Pause and display review modal
+      const correctOpt = currentQuestion.options.find(
+        (o: any) => o.id === currentQuestion.correctOptionId
+      );
+      const scaffold = getWrongAnswerScaffold(
+        currentQuestion.knowledge_component,
+        selectedOpt?.text || "Your choice",
+        correctOpt?.text || "Correct answer",
+        currentQuestion.hint,
+        currentQuestion.question || currentQuestion.question_text
+      );
+
+      setTimeout(() => {
+        setWrongFeedbackData({
+          selectedText: selectedOpt?.text || "Your choice",
+          correctText: correctOpt?.text || "Correct answer",
+          reasonEn: scaffold.reasonEn,
+          reasonAsl: scaffold.reasonAsl,
+          kcDisplayName: scaffold.kcDisplayName,
+          pendingScore: newScore,
+          pendingAnswers: updatedAnswers,
+        });
+        setWrongFeedbackVisible(true);
+      }, 450);
+    }
+  };
+
+  const handleDismissWrongFeedback = () => {
+    if (!wrongFeedbackVisible) return;
+    setWrongFeedbackVisible(false);
+    const pendingScore = wrongFeedbackData?.pendingScore ?? score;
+    const pendingAnswers = wrongFeedbackData?.pendingAnswers ?? answersRecord;
+    setWrongFeedbackData(null);
+
+    // Reset state for next question
+    shakeAnim.setValue(0);
+    setEliminatedOptionIdx(null);
+    setEliminatedOptionInfo(null);
+    setHintText(null);
+    setHintUsed(false);
+
+    if (currentQuestionIndex < quizQuestions.length - 1) {
+      setCurrentQuestionIndex(prev => prev + 1);
+      setSelectedOptionIndex(null);
+      setIsAnswered(false);
+      setShowHint(false);
+    } else {
+      setIsFinished(true);
+      submitQuizResults(pendingScore, pendingAnswers);
+    }
   };
 
   // Matching pair handler
@@ -500,7 +672,7 @@ export default function QuizScreen() {
 
     if (pairFound) {
       setMatchingFeedback('correct');
-      triggerStarPop();
+      triggerPraisePop();
       try {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
       } catch {}
@@ -511,7 +683,6 @@ export default function QuizScreen() {
 
       setTimeout(() => {
         setMatchingFeedback(null);
-        setShowStarPop(false);
       }, 800);
 
       // Check if all pairs are matched
@@ -530,6 +701,7 @@ export default function QuizScreen() {
         setAnswersRecord(updatedAnswers);
 
         setTimeout(() => {
+          setShowPraisePop(false);
           if (currentQuestionIndex < quizQuestions.length - 1) {
             setCurrentQuestionIndex(prev => prev + 1);
             setIsAnswered(false);
@@ -538,7 +710,7 @@ export default function QuizScreen() {
             setIsFinished(true);
             submitQuizResults(newScore, updatedAnswers);
           }
-        }, 1200);
+        }, 2000);
       }
     } else {
       setMatchingFeedback('wrong');
@@ -598,6 +770,10 @@ export default function QuizScreen() {
   if (isFinished) {
     const accuracy = completionResult ? completionResult.accuracy_pct : Math.round((score / quizQuestions.length) * 100);
     const passed = completionResult ? completionResult.passed : accuracy >= 70;
+    const currentDiffKey = (difficulty || 'easy').toLowerCase();
+    const starRate = currentDiffKey === 'hard' ? 6 : currentDiffKey === 'medium' ? 4 : 3;
+    const calculatedStars = passed ? (score * starRate) : 0;
+    const earnedStars = completionResult?.stars_earned !== undefined ? completionResult.stars_earned : calculatedStars;
 
     return (
       <SafeAreaView style={styles.safeArea}>
@@ -621,6 +797,33 @@ export default function QuizScreen() {
             Difficulty: {difficulty.toUpperCase()}
           </Text>
 
+          {/* Star Reward Section */}
+          {passed ? (
+            <View style={styles.rewardCardPassed}>
+              <View style={styles.rewardIconCircle}>
+                <Ionicons name="star" size={28} color="#F59E0B" />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.rewardStarCount}>+{earnedStars} Stars Earned!</Text>
+                <Text style={styles.rewardSubtext}>
+                  +{starRate} stars per correct answer ({score}/{quizQuestions.length})
+                </Text>
+              </View>
+            </View>
+          ) : (
+            <View style={styles.rewardCardFailed}>
+              <View style={styles.rewardIconCircleFailed}>
+                <Ionicons name="star-outline" size={26} color="#9CA3AF" />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.rewardFailedTitle}>0 Stars Earned</Text>
+                <Text style={styles.rewardFailedSubtext}>
+                  Score 70% or higher to pass and earn stars!
+                </Text>
+              </View>
+            </View>
+          )}
+
           {/* Offline Saved Indicator (Auditory-Free, No Emojis) */}
           {isOfflineSaved && (
             <View style={styles.offlineSavedBox}>
@@ -629,13 +832,15 @@ export default function QuizScreen() {
             </View>
           )}
 
-          {/* Stars Earned Banner */}
-          {completionResult?.stars_earned ? (
-            <View style={styles.starsEarnedRow}>
-              <Ionicons name="star" size={18} color="#F59E0B" style={{ marginRight: 6 }} />
-              <Text style={styles.starsEarnedText}>+{completionResult.stars_earned} Stars Earned</Text>
+          {/* Edge-Computed BKT Knowledge Mastery Telemetry */}
+          {bktMasteryResult && (
+            <View style={styles.bktMasteryBox}>
+              <Ionicons name="analytics-outline" size={16} color="#7C3AED" style={{ marginRight: 6 }} />
+              <Text style={styles.bktMasteryText}>
+                Mastery ({bktMasteryResult.display_name || bktMasteryResult.kc_name}): {Math.round(bktMasteryResult.p_mastery * 100)}% ({bktMasteryResult.status.toUpperCase()})
+              </Text>
             </View>
-          ) : null}
+          )}
 
           {/* Celebration Unlocks */}
           {completionResult?.unlocked_medium && (
@@ -749,14 +954,6 @@ export default function QuizScreen() {
             </View>
           ) : null}
 
-          {/* Inline Hint Banner */}
-          {!!hintText && (
-            <View style={styles.hintBanner}>
-              <Ionicons name="bulb" size={18} color="#D97706" />
-              <Text style={styles.hintBannerText}>{hintText}</Text>
-            </View>
-          )}
-
           <Text style={styles.questionText}>
             {isDeafEnglish ? currentQuestion.deafQuestion : currentQuestion.question}
           </Text>
@@ -778,19 +975,11 @@ export default function QuizScreen() {
                 }
 
                 return (
-                  <Animated.View
+                  <View
                     key={idx}
                     style={[
                       { width: '100%', position: 'relative' },
                       isSelected && !isCorrect ? { transform: [{ translateX: shakeAnim }] } : null,
-                      isEliminated
-                        ? {
-                            opacity: hintElimAnim.interpolate({
-                              inputRange: [0, 1],
-                              outputRange: [1, 0.45],
-                            }),
-                          }
-                        : null,
                     ]}
                   >
                     <TouchableOpacity
@@ -798,12 +987,10 @@ export default function QuizScreen() {
                       disabled={isAnswered || isEliminated}
                       onPress={() => handleSelectOption(idx)}
                     >
-                      <View style={styles.optionLetterBox}>
-                        {isEliminated ? (
-                          <Ionicons name="close" size={14} color="#9CA3AF" />
-                        ) : (
-                          <Text style={styles.optionLetter}>{option.id}</Text>
-                        )}
+                      <View style={[styles.optionLetterBox, isEliminated && styles.optionLetterBoxEliminated]}>
+                        <Text style={[styles.optionLetter, isEliminated && styles.optionLetterEliminated]}>
+                          {option.id}
+                        </Text>
                       </View>
                       <Text style={[styles.optionText, isEliminated && styles.optionTextEliminated]}>
                         {isDeafEnglish ? option.deafText : option.text}
@@ -817,46 +1004,69 @@ export default function QuizScreen() {
                             {
                               width: hintElimAnim.interpolate({
                                 inputRange: [0, 1],
-                                outputRange: ['0%', '78%'],
+                                outputRange: ['0%', '76%'],
                               }),
                             },
                           ]}
                         />
                       )}
 
-                      {/* Floating +10 Stars Pop Animation */}
-                      {isAnswered && isCorrect && showStarPop && (
+                      {/* Eliminated Badge on Right */}
+                      {isEliminated && (
+                        <View style={styles.eliminatedBadge}>
+                          <Ionicons name="close-circle" size={14} color="#DC2626" style={{ marginRight: 4 }} />
+                          <Text style={styles.eliminatedBadgeText}>INCORRECT</Text>
+                        </View>
+                      )}
+
+                      {/* Floating Praise Pop Animation */}
+                      {isAnswered && isCorrect && showPraisePop && (
                         <Animated.View
                           style={[
-                            styles.starPopBadge,
+                            styles.praisePopBadge,
                             {
-                              opacity: starPopAnim.interpolate({
-                                inputRange: [0, 0.7, 1],
-                                outputRange: [1, 1, 0],
+                              opacity: praisePopAnim.interpolate({
+                                inputRange: [0, 0.2, 0.8, 1],
+                                outputRange: [0, 1, 1, 0],
                               }),
                               transform: [
                                 {
-                                  translateY: starPopAnim.interpolate({
+                                  translateY: praisePopAnim.interpolate({
                                     inputRange: [0, 1],
                                     outputRange: [0, -38],
                                   }),
                                 },
                                 {
-                                  scale: starPopAnim.interpolate({
+                                  scale: praisePopAnim.interpolate({
                                     inputRange: [0, 0.25, 1],
-                                    outputRange: [0.5, 1.15, 0.95],
+                                    outputRange: [0.6, 1.15, 1],
                                   }),
                                 },
                               ],
                             },
                           ]}
                         >
-                          <Ionicons name="star" size={15} color="#F59E0B" />
-                          <Text style={styles.starPopText}>+10 Stars</Text>
+                          <Ionicons name="checkmark-circle" size={15} color="#15803D" style={{ marginRight: 4 }} />
+                          <Text style={styles.praisePopText}>{praiseText}</Text>
                         </Animated.View>
                       )}
                     </TouchableOpacity>
-                  </Animated.View>
+
+                    {/* Explanatory Scaffolding Box for Eliminated Distractor */}
+                    {isEliminated && eliminatedOptionInfo && (
+                      <View style={styles.eliminationCalloutBox}>
+                        <View style={styles.eliminationCalloutHeader}>
+                          <Ionicons name="information-circle" size={18} color="#DC2626" style={{ marginRight: 6 }} />
+                          <Text style={styles.eliminationCalloutTitle}>
+                            Why Option {option.id} is Incorrect:
+                          </Text>
+                        </View>
+                        <Text style={styles.eliminationCalloutReason}>
+                          {eliminatedOptionInfo.reasonEn}
+                        </Text>
+                      </View>
+                    )}
+                  </View>
                 );
               })}
             </View>
@@ -865,35 +1075,35 @@ export default function QuizScreen() {
           {/* Matching Pairs UI */}
           {currentQuestion.question_type === 'matching' && (
             <View>
-              {/* Matching Feedback Star Pop */}
-              {matchingFeedback === 'correct' && showStarPop && (
+              {/* Matching Praise Pop */}
+              {matchingFeedback === 'correct' && showPraisePop && (
                 <Animated.View
                   style={[
-                    styles.matchingStarPopBadge,
+                    styles.matchingPraisePopBadge,
                     {
-                      opacity: starPopAnim.interpolate({
-                        inputRange: [0, 0.7, 1],
-                        outputRange: [1, 1, 0],
+                      opacity: praisePopAnim.interpolate({
+                        inputRange: [0, 0.2, 0.8, 1],
+                        outputRange: [0, 1, 1, 0],
                       }),
                       transform: [
                         {
-                          translateY: starPopAnim.interpolate({
+                          translateY: praisePopAnim.interpolate({
                             inputRange: [0, 1],
-                            outputRange: [0, -25],
+                            outputRange: [0, -20],
                           }),
                         },
                         {
-                          scale: starPopAnim.interpolate({
+                          scale: praisePopAnim.interpolate({
                             inputRange: [0, 0.25, 1],
-                            outputRange: [0.6, 1.2, 1],
+                            outputRange: [0.6, 1.15, 1],
                           }),
                         },
                       ],
                     },
                   ]}
                 >
-                  <Ionicons name="star" size={16} color="#F59E0B" />
-                  <Text style={styles.starPopText}>+10 Stars Matched!</Text>
+                  <Ionicons name="checkmark-circle" size={16} color="#15803D" style={{ marginRight: 6 }} />
+                  <Text style={styles.praisePopText}>{praiseText}</Text>
                 </Animated.View>
               )}
 
@@ -1021,10 +1231,95 @@ export default function QuizScreen() {
               }}
             >
               <Ionicons name="language-outline" size={20} color="white" />
-              <Text style={{ color: 'white', fontWeight: '700', fontSize: 15 }}>Translate</Text>
             </TouchableOpacity>
           </View>
         </View>
+      </Modal>
+
+      {/* Post-Submission Wrong Answer Scaffolding Modal */}
+      <Modal
+        animationType="fade"
+        transparent={true}
+        visible={wrongFeedbackVisible}
+        onRequestClose={handleDismissWrongFeedback}
+      >
+        <TouchableOpacity
+          style={styles.reviewModalOverlay}
+          activeOpacity={1}
+          onPress={handleDismissWrongFeedback}
+        >
+          <TouchableOpacity
+            style={styles.reviewModalContent}
+            activeOpacity={1}
+            onPress={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <View style={styles.reviewModalHeader}>
+              <View style={styles.reviewHeaderBadge}>
+                <Ionicons name="bulb" size={20} color="#D97706" />
+                <Text style={styles.reviewHeaderTitle}>
+                  Let's Review: {wrongFeedbackData?.kcDisplayName || 'Concept'}
+                </Text>
+              </View>
+              <TouchableOpacity onPress={handleDismissWrongFeedback} style={styles.reviewCloseBtn}>
+                <Ionicons name="close" size={22} color="#6B7280" />
+              </TouchableOpacity>
+            </View>
+
+            {/* Your Choice vs Correct Answer Cards */}
+            <View style={styles.reviewCardsRow}>
+              {/* Selected Choice (Wrong) */}
+              <View style={styles.reviewWrongBox}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
+                  <Ionicons name="close-circle" size={15} color="#EF4444" style={{ marginRight: 5 }} />
+                  <Text style={styles.reviewWrongLabel}>Your Answer</Text>
+                </View>
+                <Text style={styles.reviewWrongText} numberOfLines={2}>
+                  {wrongFeedbackData?.selectedText}
+                </Text>
+              </View>
+
+              {/* Correct Answer */}
+              <View style={styles.reviewCorrectBox}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 4 }}>
+                  <Ionicons name="checkmark-circle" size={15} color="#10B981" style={{ marginRight: 5 }} />
+                  <Text style={styles.reviewCorrectLabel}>Correct Answer</Text>
+                </View>
+                <Text style={styles.reviewCorrectText} numberOfLines={2}>
+                  {wrongFeedbackData?.correctText}
+                </Text>
+              </View>
+            </View>
+
+            {/* Why it was wrong / Explanation */}
+            <View style={styles.reviewExplanationCard}>
+              <Text style={styles.reviewExplanationLabel}>EXPLANATION</Text>
+              <Text style={styles.reviewExplanationBody}>
+                {wrongFeedbackData?.reasonEn}
+              </Text>
+            </View>
+
+            {/* ASL / Deaf English Scaffolding Box */}
+            {!!wrongFeedbackData?.reasonAsl && (
+              <View style={styles.reviewAslBox}>
+                <Text style={styles.reviewAslLabel}>ASL / DEAF ENGLISH SCAFFOLD</Text>
+                <Text style={styles.reviewAslBody}>
+                  {wrongFeedbackData?.reasonAsl}
+                </Text>
+              </View>
+            )}
+
+            {/* Continue Button */}
+            <TouchableOpacity
+              style={styles.reviewContinueBtn}
+              onPress={handleDismissWrongFeedback}
+            >
+              <Text style={styles.reviewContinueBtnText}>Next Question</Text>
+              <Ionicons name="arrow-forward" size={18} color="white" />
+            </TouchableOpacity>
+            <Text style={styles.reviewTapAnywhereText}>Tap anywhere to continue</Text>
+          </TouchableOpacity>
+        </TouchableOpacity>
       </Modal>
     </SafeAreaView>
   );
@@ -1098,8 +1393,43 @@ const styles = StyleSheet.create({
   aslOriginalBox: { backgroundColor: '#F3F4F6', borderRadius: 10, padding: 12, marginBottom: 14 },
   aslResultBox: { backgroundColor: '#EDE9FE', borderRadius: 10, padding: 12, marginTop: 14 },
   aslResultLabel: { fontSize: 11, color: '#7C3AED', fontWeight: '600', marginBottom: 4 },
-  optionEliminated: { opacity: 0.45, backgroundColor: '#F3F4F6', borderColor: '#D1D5DB' },
-  optionTextEliminated: { textDecorationLine: 'line-through', color: '#9CA3AF' },
+  optionEliminated: {
+    backgroundColor: '#FEF2F2',
+    borderColor: '#FCA5A5',
+    borderWidth: 1.5,
+  },
+  optionLetterBoxEliminated: {
+    backgroundColor: '#FEE2E2',
+    borderColor: '#FCA5A5',
+    borderWidth: 1.5,
+  },
+  optionLetterEliminated: {
+    color: '#DC2626',
+    fontWeight: 'bold',
+  },
+  optionTextEliminated: {
+    textDecorationLine: 'line-through',
+    textDecorationColor: '#DC2626',
+    color: '#374151',
+    fontWeight: '500',
+  },
+  eliminatedBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#FEE2E2',
+    borderColor: '#FECACA',
+    borderWidth: 1,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    marginLeft: 8,
+  },
+  eliminatedBadgeText: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: '#DC2626',
+    letterSpacing: 0.5,
+  },
   strikethroughLine: {
     position: 'absolute',
     left: 56,
@@ -1114,46 +1444,45 @@ const styles = StyleSheet.create({
   headerSub: { fontSize: 12, color: '#6B7280', marginTop: 2 },
   doneButton: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#7C3AED', paddingVertical: 12, paddingHorizontal: 24, borderRadius: 12, marginTop: 20 },
   doneButtonText: { color: 'white', fontSize: 16, fontWeight: 'bold', marginRight: 8 },
-  starPopBadge: {
+  praisePopBadge: {
     position: 'absolute',
-    right: 12,
-    top: -10,
+    right: 14,
+    top: -12,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 4,
-    backgroundColor: '#FEF3C7',
+    backgroundColor: '#DCFCE7',
     borderWidth: 1.5,
-    borderColor: '#F59E0B',
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 12,
-    shadowColor: '#F59E0B',
+    borderColor: '#86EFAC',
+    paddingHorizontal: 12,
+    paddingVertical: 5,
+    borderRadius: 14,
+    shadowColor: '#16A34A',
     shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
+    shadowOpacity: 0.2,
     shadowRadius: 4,
     elevation: 6,
     zIndex: 20,
   },
-  starPopText: {
-    fontSize: 12,
-    fontWeight: 'bold',
-    color: '#92400E',
+  praisePopText: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#15803D',
+    letterSpacing: 0.3,
   },
-  matchingStarPopBadge: {
+  matchingPraisePopBadge: {
     alignSelf: 'center',
-    marginBottom: 10,
+    marginBottom: 12,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
-    backgroundColor: '#FEF3C7',
+    backgroundColor: '#DCFCE7',
     borderWidth: 1.5,
-    borderColor: '#F59E0B',
-    paddingHorizontal: 14,
-    paddingVertical: 6,
+    borderColor: '#86EFAC',
+    paddingHorizontal: 16,
+    paddingVertical: 7,
     borderRadius: 16,
-    shadowColor: '#F59E0B',
+    shadowColor: '#16A34A',
     shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
+    shadowOpacity: 0.2,
     shadowRadius: 4,
     elevation: 6,
   },
@@ -1174,21 +1503,265 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#D97706',
   },
-  starsEarnedRow: {
+  rewardCardPassed: {
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: '#FEF3C7',
-    paddingHorizontal: 14,
-    paddingVertical: 6,
+    borderWidth: 2,
+    borderColor: '#F59E0B',
     borderRadius: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    marginTop: 14,
+    marginBottom: 6,
+    width: '100%',
+    shadowColor: '#F59E0B',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 6,
+    elevation: 3,
+  },
+  rewardIconCircle: {
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: '#FDE68A',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 14,
+  },
+  rewardStarCount: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#92400E',
+  },
+  rewardSubtext: {
+    fontSize: 12,
+    color: '#B45309',
+    fontWeight: '600',
+    marginTop: 2,
+  },
+  rewardCardFailed: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#F3F4F6',
+    borderWidth: 1.5,
+    borderColor: '#D1D5DB',
+    borderRadius: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    marginTop: 14,
+    marginBottom: 6,
+    width: '100%',
+  },
+  rewardIconCircleFailed: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: '#E5E7EB',
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginRight: 14,
+  },
+  rewardFailedTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#4B5563',
+  },
+  rewardFailedSubtext: {
+    fontSize: 12,
+    color: '#6B7280',
+    fontWeight: '500',
+    marginTop: 2,
+  },
+  bktMasteryBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#EDE9FE',
+    borderWidth: 1,
+    borderColor: '#DDD6FE',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 12,
     marginTop: 8,
     marginBottom: 6,
-    borderWidth: 1,
-    borderColor: '#FDE68A',
   },
-  starsEarnedText: {
+  bktMasteryText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#6D28D9',
+  },
+  // Scaffolding Callout for Eliminated Distractor
+  eliminationCalloutBox: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#FECACA',
+    borderRadius: 12,
+    padding: 14,
+    marginTop: 8,
+    marginBottom: 6,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.06,
+    shadowRadius: 3,
+    elevation: 2,
+  },
+  eliminationCalloutHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  eliminationCalloutTitle: {
     fontSize: 13,
     fontWeight: '700',
-    color: '#B45309',
+    color: '#DC2626',
+  },
+  eliminationCalloutReason: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: '#1F2937',
+    lineHeight: 20,
+  },
+  // Wrong Answer Scaffolding Review Modal
+  reviewModalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'flex-end',
+  },
+  reviewModalContent: {
+    backgroundColor: 'white',
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    padding: 22,
+    maxHeight: '85%',
+  },
+  reviewModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 14,
+  },
+  reviewHeaderBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  reviewHeaderTitle: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: '#1F2937',
+  },
+  reviewCloseBtn: {
+    padding: 4,
+  },
+  reviewCardsRow: {
+    flexDirection: 'row',
+    gap: 10,
+    marginBottom: 12,
+  },
+  reviewWrongBox: {
+    flex: 1,
+    backgroundColor: '#FEF2F2',
+    borderWidth: 1,
+    borderColor: '#FCA5A5',
+    borderRadius: 12,
+    padding: 10,
+  },
+  reviewWrongLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#DC2626',
+    marginLeft: 4,
+  },
+  reviewWrongText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#991B1B',
+    textDecorationLine: 'line-through',
+    marginTop: 2,
+  },
+  reviewCorrectBox: {
+    flex: 1,
+    backgroundColor: '#F0FDF4',
+    borderWidth: 1,
+    borderColor: '#86EFAC',
+    borderRadius: 12,
+    padding: 10,
+  },
+  reviewCorrectLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#16A34A',
+    marginLeft: 4,
+  },
+  reviewCorrectText: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#166534',
+    marginTop: 2,
+  },
+  reviewExplanationCard: {
+    backgroundColor: '#F8FAFC',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    padding: 12,
+    marginBottom: 10,
+  },
+  reviewExplanationLabel: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#64748B',
+    letterSpacing: 0.5,
+    marginBottom: 4,
+  },
+  reviewExplanationBody: {
+    fontSize: 13,
+    color: '#334155',
+    lineHeight: 19,
+  },
+  reviewAslBox: {
+    backgroundColor: '#EDE9FE',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 16,
+  },
+  reviewAslLabel: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#7C3AED',
+    letterSpacing: 0.5,
+    marginBottom: 4,
+  },
+  reviewAslBody: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#4C1D95',
+    lineHeight: 18,
+    letterSpacing: 0.3,
+  },
+  reviewContinueBtn: {
+    backgroundColor: '#7C3AED',
+    borderRadius: 12,
+    paddingVertical: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    shadowColor: '#7C3AED',
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    elevation: 4,
+  },
+  reviewContinueBtnText: {
+    color: 'white',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  reviewTapAnywhereText: {
+    textAlign: 'center',
+    fontSize: 11,
+    color: '#9CA3AF',
+    marginTop: 8,
   },
 });

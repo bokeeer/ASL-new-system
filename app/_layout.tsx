@@ -10,8 +10,13 @@ function RootLayoutContent() {
   useEffect(() => {
     if (!isLoading) {
       if (user) {
-        // User exists in storage, route directly home
-        router.replace("/(tabs)/home");
+        if (user.role === "admin") {
+          router.replace("/admin" as any);
+        } else if (user.role === "teacher") {
+          router.replace("/teacher" as any);
+        } else {
+          router.replace("/(tabs)/home");
+        }
       } else {
         // No user, make sure we go to login
         router.replace("/");
@@ -28,15 +33,24 @@ function RootLayoutContent() {
   }
 
   return (
-    <Stack>
+    <Stack screenOptions={{ headerShown: false }}>
       <Stack.Screen name="index" options={{ headerShown: false }} />
       <Stack.Screen name="register" options={{ headerShown: false }} />
       <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
       <Stack.Screen name="subject/[id]" options={{ headerShown: false }} />
       <Stack.Screen name="topic/[id]" options={{ headerShown: false }} />
+      <Stack.Screen name="difficulty/[id]" options={{ headerShown: false }} />
       <Stack.Screen name="quiz/[id]" options={{ headerShown: false }} />
       <Stack.Screen name="enhance/[id]" options={{ headerShown: false }} />
       <Stack.Screen name="admin" options={{ headerShown: false }} />
+      <Stack.Screen name="teacher" options={{ headerShown: false }} />
+      <Stack.Screen name="daily-quiz" options={{ headerShown: false }} />
+      <Stack.Screen name="leaderboard" options={{ headerShown: false }} />
+      <Stack.Screen name="report" options={{ headerShown: false }} />
+      <Stack.Screen name="badges" options={{ headerShown: false }} />
+      <Stack.Screen name="skill-tree" options={{ headerShown: false }} />
+      <Stack.Screen name="past-reports" options={{ headerShown: false }} />
+      <Stack.Screen name="flashcards" options={{ headerShown: false }} />
     </Stack>
   );
 }
