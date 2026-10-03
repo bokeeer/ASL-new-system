@@ -239,6 +239,37 @@ def init_db():
                 ADD COLUMN IF NOT EXISTS plain_password VARCHAR(255);
         """)
 
+        # ── Soft Deletes & Teacher Activity Audit Log ─────────────────────────
+        cur.execute("""
+            ALTER TABLE lesson_groups
+                ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP,
+                ADD COLUMN IF NOT EXISTS deleted_by VARCHAR(255);
+
+            ALTER TABLE lessons
+                ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP,
+                ADD COLUMN IF NOT EXISTS deleted_by VARCHAR(255);
+
+            ALTER TABLE quizzes
+                ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE,
+                ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP,
+                ADD COLUMN IF NOT EXISTS deleted_by VARCHAR(255);
+
+            CREATE TABLE IF NOT EXISTS teacher_activity_logs (
+                id SERIAL PRIMARY KEY,
+                teacher_id INTEGER,
+                teacher_name VARCHAR(255) NOT NULL,
+                action_type VARCHAR(50) NOT NULL,
+                target_type VARCHAR(50) NOT NULL,
+                target_id INTEGER,
+                target_title VARCHAR(255),
+                topic_id VARCHAR(100),
+                details TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
         # Ensure Admin account exists with requested password 'wvsuadmin123'
         admin_hash = pwd_context.hash("wvsuadmin123")
         cur.execute("SELECT id FROM users WHERE username = 'admin'")
@@ -530,6 +561,12 @@ class QuizCreateRequest(BaseModel):
     difficulty: str = 'easy'        # inherited from lesson
     questions: list[QuestionInput]
 
+class TrashActionRequest(BaseModel):
+    item_type: str  # 'lesson_group' | 'lesson' | 'quiz'
+    item_id: int
+    teacher_name: Optional[str] = "Teacher"
+    teacher_id: Optional[int] = None
+
 class KCCreateRequest(BaseModel):
     topic_id: str
     name: str          # machine name e.g. "identify_vowels"
@@ -634,6 +671,22 @@ def login(req: LoginRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def log_teacher_activity(teacher_name: str, action_type: str, target_type: str, target_id: int, target_title: str, topic_id: str = None, details: str = None, teacher_id: int = None):
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO teacher_activity_logs 
+            (teacher_id, teacher_name, action_type, target_type, target_id, target_title, topic_id, details)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (teacher_id, teacher_name or "Teacher", action_type, target_type, target_id, target_title, topic_id, details))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Error logging teacher activity: {e}")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Milestone 2: Lesson Group + Lesson CRUD ───────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
@@ -679,7 +732,7 @@ def get_lesson_groups(topic_id: str):
         conn = get_db()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            "SELECT id, topic_id, title, order_index, created_at FROM lesson_groups WHERE topic_id = %s ORDER BY order_index ASC, id ASC",
+            "SELECT id, topic_id, title, order_index, created_at FROM lesson_groups WHERE topic_id = %s AND COALESCE(is_deleted, FALSE) = FALSE ORDER BY order_index ASC, id ASC",
             (topic_id,),
         )
         groups = cur.fetchall()
@@ -687,17 +740,21 @@ def get_lesson_groups(topic_id: str):
         for g in groups:
             # Fetch all difficulty lessons under this group
             cur.execute(
-                "SELECT id, title, difficulty, created_at FROM lessons WHERE lesson_group_id = %s ORDER BY id ASC",
+                "SELECT id, title, difficulty, created_at FROM lessons WHERE lesson_group_id = %s AND COALESCE(is_deleted, FALSE) = FALSE ORDER BY id ASC",
                 (g["id"],)
             )
             lessons = cur.fetchall()
             # Count slides per lesson
             lessons_with_counts = []
             for l in lessons:
-                cur.execute("SELECT COUNT(*) as cnt FROM lesson_slides WHERE lesson_id = %s", (l["id"],))
-                slide_count = cur.fetchone()["cnt"]
+                cur.execute(
+                    "SELECT id, slide_index, description_text, image_url FROM lesson_slides WHERE lesson_id = %s ORDER BY slide_index ASC",
+                    (l["id"],)
+                )
+                slides = [dict(s) for s in cur.fetchall()]
+                slide_count = len(slides)
                 # Fetch quiz for this lesson
-                cur.execute("SELECT id FROM quizzes WHERE lesson_id = %s LIMIT 1", (l["id"],))
+                cur.execute("SELECT id FROM quizzes WHERE lesson_id = %s AND COALESCE(is_deleted, FALSE) = FALSE LIMIT 1", (l["id"],))
                 quiz_row = cur.fetchone()
                 quiz_question_count = 0
                 quiz_id = None
@@ -707,6 +764,7 @@ def get_lesson_groups(topic_id: str):
                     quiz_question_count = cur.fetchone()["cnt"]
                 lessons_with_counts.append({
                     **dict(l),
+                    "slides": slides,
                     "slide_count": slide_count,
                     "quiz_id": quiz_id,
                     "quiz_question_count": quiz_question_count,
@@ -723,15 +781,75 @@ def get_lesson_groups(topic_id: str):
 
 
 @app.delete("/admin/lesson-group/{group_id}")
-def delete_lesson_group(group_id: int):
+def delete_lesson_group(group_id: int, teacher_name: str = "Teacher"):
     try:
         conn = get_db()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM lesson_groups WHERE id = %s", (group_id,))
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT id, title, topic_id FROM lesson_groups WHERE id = %s", (group_id,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            raise HTTPException(status_code=404, detail="Lesson group not found.")
+        
+        # Soft delete lesson group and all its lessons
+        cur.execute(
+            "UPDATE lesson_groups SET is_deleted = TRUE, deleted_at = NOW(), deleted_by = %s WHERE id = %s",
+            (teacher_name, group_id)
+        )
+        cur.execute(
+            "UPDATE lessons SET is_deleted = TRUE, deleted_at = NOW(), deleted_by = %s WHERE lesson_group_id = %s",
+            (teacher_name, group_id)
+        )
         conn.commit()
         cur.close()
         conn.close()
-        return {"success": True}
+        
+        log_teacher_activity(
+            teacher_name=teacher_name,
+            action_type="trash_lesson",
+            target_type="lesson_group",
+            target_id=group_id,
+            target_title=row["title"],
+            topic_id=row["topic_id"],
+            details=f"Moved lesson story '{row['title']}' to Trash."
+        )
+        return {"success": True, "message": f"Moved '{row['title']}' to Trash."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/admin/lesson/{lesson_id}")
+def delete_lesson(lesson_id: int, teacher_name: str = "Teacher"):
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT id, title, topic_id, difficulty FROM lessons WHERE id = %s", (lesson_id,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            raise HTTPException(status_code=404, detail="Lesson not found.")
+        
+        cur.execute("UPDATE lessons SET is_deleted = TRUE, deleted_at = NOW(), deleted_by = %s WHERE id = %s", (teacher_name, lesson_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        log_teacher_activity(
+            teacher_name=teacher_name,
+            action_type="trash_lesson",
+            target_type="lesson",
+            target_id=lesson_id,
+            target_title=row["title"],
+            topic_id=row["topic_id"],
+            details=f"Moved {row.get('difficulty', 'easy').upper()} tier to Trash."
+        )
+        return {"success": True, "message": f"Moved lesson to Trash."}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -790,7 +908,7 @@ def get_lessons_by_topic(topic_id: str):
 
         # Fetch lesson groups for this topic (ordered)
         cur.execute(
-            "SELECT id, topic_id, title, order_index FROM lesson_groups WHERE topic_id = %s ORDER BY order_index ASC, id ASC",
+            "SELECT id, topic_id, title, order_index FROM lesson_groups WHERE topic_id = %s AND COALESCE(is_deleted, FALSE) = FALSE ORDER BY order_index ASC, id ASC",
             (topic_id,)
         )
         groups = cur.fetchall()
@@ -798,7 +916,7 @@ def get_lessons_by_topic(topic_id: str):
         result = []
         for g in groups:
             cur.execute(
-                "SELECT id, topic_id, title, difficulty, lesson_group_id, created_at FROM lessons WHERE lesson_group_id = %s ORDER BY id ASC",
+                "SELECT id, topic_id, title, difficulty, lesson_group_id, created_at FROM lessons WHERE lesson_group_id = %s AND COALESCE(is_deleted, FALSE) = FALSE ORDER BY id ASC",
                 (g["id"],)
             )
             lessons = cur.fetchall()
@@ -810,7 +928,7 @@ def get_lessons_by_topic(topic_id: str):
                 )
                 slides = cur.fetchall()
                 # Get quiz_id for this lesson
-                cur.execute("SELECT id FROM quizzes WHERE lesson_id = %s LIMIT 1", (l["id"],))
+                cur.execute("SELECT id FROM quizzes WHERE lesson_id = %s AND COALESCE(is_deleted, FALSE) = FALSE LIMIT 1", (l["id"],))
                 quiz_row = cur.fetchone()
                 group_lessons.append({
                     **dict(l),
@@ -824,7 +942,7 @@ def get_lessons_by_topic(topic_id: str):
 
         # Fallback: also return ungrouped lessons (lesson_group_id IS NULL) for backward compat
         cur.execute(
-            "SELECT id, topic_id, title, difficulty, lesson_group_id, created_at FROM lessons WHERE topic_id = %s AND lesson_group_id IS NULL ORDER BY id ASC",
+            "SELECT id, topic_id, title, difficulty, lesson_group_id, created_at FROM lessons WHERE topic_id = %s AND lesson_group_id IS NULL AND COALESCE(is_deleted, FALSE) = FALSE ORDER BY id ASC",
             (topic_id,)
         )
         ungrouped = cur.fetchall()
@@ -851,20 +969,6 @@ def get_lessons_by_topic(topic_id: str):
         cur.close()
         conn.close()
         return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/admin/lesson/{lesson_id}")
-def delete_lesson(lesson_id: int):
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM lessons WHERE id = %s", (lesson_id,))
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {"success": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -903,6 +1007,15 @@ def update_lesson_slides(lesson_id: int, req: UpdateLessonSlidesRequest):
         conn.commit()
         cur.close()
         conn.close()
+
+        log_teacher_activity(
+            teacher_name="Teacher",
+            action_type="edit_slides",
+            target_type="lesson",
+            target_id=lesson_id,
+            target_title=f"Lesson #{lesson_id}",
+            details=f"Updated slides ({len(req.slides)} slides)."
+        )
         return {"success": True, "message": "Slides updated successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -999,6 +1112,16 @@ def create_quiz(req: QuizCreateRequest):
         conn.commit()
         cur.close()
         conn.close()
+
+        log_teacher_activity(
+            teacher_name="Teacher",
+            action_type="create_quiz",
+            target_type="quiz",
+            target_id=quiz_id,
+            target_title=req.title,
+            topic_id=req.topic_id,
+            details=f"Created {req.difficulty.upper()} quiz with {len(req.questions)} questions."
+        )
         return {"success": True, "quiz_id": quiz_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1067,12 +1190,12 @@ def get_quizzes_by_topic(topic_id: str):
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT id FROM quizzes WHERE topic_id = %s ORDER BY id DESC", (topic_id,))
+        cur.execute("SELECT id FROM quizzes WHERE topic_id = %s AND COALESCE(is_deleted, FALSE) = FALSE ORDER BY id DESC", (topic_id,))
         quiz_rows = cur.fetchall()
         result = [_fetch_full_quiz(cur, r["id"]) for r in quiz_rows if r]
         cur.close()
         conn.close()
-        return result
+        return [r for r in result if r is not None]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1082,7 +1205,7 @@ def get_quiz_by_lesson(lesson_id: int):
     try:
         conn = get_db()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT id FROM quizzes WHERE lesson_id = %s ORDER BY id DESC LIMIT 1", (lesson_id,))
+        cur.execute("SELECT id FROM quizzes WHERE lesson_id = %s AND COALESCE(is_deleted, FALSE) = FALSE ORDER BY id DESC LIMIT 1", (lesson_id,))
         row = cur.fetchone()
         if not row:
             cur.close()
@@ -3645,8 +3768,269 @@ def update_admin_quiz_questions(quiz_id: int, req: UpdateQuizQuestionsRequest):
         conn.commit()
         cur.close()
         conn.close()
+
+        log_teacher_activity(
+            teacher_name="Teacher",
+            action_type="edit_quiz",
+            target_type="quiz",
+            target_id=quiz_id,
+            target_title=f"Quiz #{quiz_id}",
+            details=f"Updated questions pool ({len(req.questions)} questions)."
+        )
         return {"success": True, "message": f"Successfully updated {len(req.questions)} questions."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/admin/quiz/{quiz_id}")
+def delete_quiz(quiz_id: int, teacher_name: str = "Teacher"):
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT id, title, topic_id, difficulty FROM quizzes WHERE id = %s", (quiz_id,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            raise HTTPException(status_code=404, detail="Quiz not found.")
+
+        # Soft delete quiz
+        cur.execute(
+            "UPDATE quizzes SET is_deleted = TRUE, deleted_at = NOW(), deleted_by = %s WHERE id = %s",
+            (teacher_name, quiz_id)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        log_teacher_activity(
+            teacher_name=teacher_name,
+            action_type="trash_quiz",
+            target_type="quiz",
+            target_id=quiz_id,
+            target_title=row["title"],
+            topic_id=row["topic_id"],
+            details=f"Moved quiz '{row['title']}' ({row.get('difficulty', 'easy').upper()}) to Trash."
+        )
+        return {"success": True, "message": f"Moved quiz '{row['title']}' to Trash."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/trash")
+def get_trash():
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # Fetch trashed lesson groups
+        cur.execute("""
+            SELECT id, title, topic_id, 'lesson_group' as item_type, deleted_at, deleted_by
+            FROM lesson_groups
+            WHERE is_deleted = TRUE
+            ORDER BY deleted_at DESC
+        """)
+        trashed_groups = cur.fetchall()
+
+        # Fetch trashed individual lessons if any
+        cur.execute("""
+            SELECT id, title, topic_id, difficulty, 'lesson' as item_type, deleted_at, deleted_by
+            FROM lessons
+            WHERE is_deleted = TRUE AND lesson_group_id IS NULL
+            ORDER BY deleted_at DESC
+        """)
+        trashed_lessons = cur.fetchall()
+
+        # Fetch trashed quizzes
+        cur.execute("""
+            SELECT id, title, topic_id, difficulty, 'quiz' as item_type, deleted_at, deleted_by
+            FROM quizzes
+            WHERE is_deleted = TRUE
+            ORDER BY deleted_at DESC
+        """)
+        trashed_quizzes = cur.fetchall()
+
+        cur.close()
+        conn.close()
+        all_items = [dict(g) for g in trashed_groups] + [dict(l) for l in trashed_lessons] + [dict(q) for q in trashed_quizzes]
+        return {
+            "success": True,
+            "trash": all_items,
+            "total_count": len(all_items)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/trash/restore")
+def restore_trash(req: TrashActionRequest):
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        target_title = ""
+        topic_id = None
+
+        if req.item_type == "lesson_group":
+            cur.execute("SELECT id, title, topic_id FROM lesson_groups WHERE id = %s", (req.item_id,))
+            row = cur.fetchone()
+            if not row:
+                cur.close()
+                conn.close()
+                raise HTTPException(status_code=404, detail="Item not found.")
+            target_title = row["title"]
+            topic_id = row["topic_id"]
+            cur.execute("UPDATE lesson_groups SET is_deleted = FALSE, deleted_at = NULL, deleted_by = NULL WHERE id = %s", (req.item_id,))
+            cur.execute("UPDATE lessons SET is_deleted = FALSE, deleted_at = NULL, deleted_by = NULL WHERE lesson_group_id = %s", (req.item_id,))
+            action = "restore_lesson"
+            detail = f"Restored lesson story '{target_title}' from Trash."
+        elif req.item_type == "lesson":
+            cur.execute("SELECT id, title, topic_id FROM lessons WHERE id = %s", (req.item_id,))
+            row = cur.fetchone()
+            if not row:
+                cur.close()
+                conn.close()
+                raise HTTPException(status_code=404, detail="Lesson not found.")
+            target_title = row["title"]
+            topic_id = row["topic_id"]
+            cur.execute("UPDATE lessons SET is_deleted = FALSE, deleted_at = NULL, deleted_by = NULL WHERE id = %s", (req.item_id,))
+            action = "restore_lesson"
+            detail = f"Restored lesson '{target_title}' from Trash."
+        elif req.item_type == "quiz":
+            cur.execute("SELECT id, title, topic_id FROM quizzes WHERE id = %s", (req.item_id,))
+            row = cur.fetchone()
+            if not row:
+                cur.close()
+                conn.close()
+                raise HTTPException(status_code=404, detail="Quiz not found.")
+            target_title = row["title"]
+            topic_id = row["topic_id"]
+            cur.execute("UPDATE quizzes SET is_deleted = FALSE, deleted_at = NULL, deleted_by = NULL WHERE id = %s", (req.item_id,))
+            action = "restore_quiz"
+            detail = f"Restored quiz '{target_title}' from Trash."
+        else:
+            cur.close()
+            conn.close()
+            raise HTTPException(status_code=400, detail="Invalid item_type.")
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        log_teacher_activity(
+            teacher_name=req.teacher_name or "Teacher",
+            action_type=action,
+            target_type=req.item_type,
+            target_id=req.item_id,
+            target_title=target_title,
+            topic_id=topic_id,
+            details=detail,
+            teacher_id=req.teacher_id
+        )
+        return {"success": True, "message": f"Successfully restored '{target_title}'."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/admin/trash/permanent")
+def permanent_delete_trash(req: TrashActionRequest):
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        target_title = ""
+        topic_id = None
+
+        if req.item_type == "lesson_group":
+            cur.execute("SELECT id, title, topic_id FROM lesson_groups WHERE id = %s", (req.item_id,))
+            row = cur.fetchone()
+            if row:
+                target_title = row["title"]
+                topic_id = row["topic_id"]
+            cur.execute("SELECT id FROM lessons WHERE lesson_group_id = %s", (req.item_id,))
+            l_rows = cur.fetchall()
+            for lr in l_rows:
+                cur.execute("DELETE FROM lesson_slides WHERE lesson_id = %s", (lr["id"],))
+            cur.execute("DELETE FROM lessons WHERE lesson_group_id = %s", (req.item_id,))
+            cur.execute("DELETE FROM lesson_groups WHERE id = %s", (req.item_id,))
+            action = "permanent_delete"
+            detail = f"Permanently deleted lesson story '{target_title}'."
+        elif req.item_type == "lesson":
+            cur.execute("SELECT id, title, topic_id FROM lessons WHERE id = %s", (req.item_id,))
+            row = cur.fetchone()
+            if row:
+                target_title = row["title"]
+                topic_id = row["topic_id"]
+            cur.execute("DELETE FROM lesson_slides WHERE lesson_id = %s", (req.item_id,))
+            cur.execute("DELETE FROM lessons WHERE id = %s", (req.item_id,))
+            action = "permanent_delete"
+            detail = f"Permanently deleted lesson '{target_title}'."
+        elif req.item_type == "quiz":
+            cur.execute("SELECT id, title, topic_id FROM quizzes WHERE id = %s", (req.item_id,))
+            row = cur.fetchone()
+            if row:
+                target_title = row["title"]
+                topic_id = row["topic_id"]
+            cur.execute("SELECT id FROM questions WHERE quiz_id = %s", (req.item_id,))
+            q_ids = [r["id"] for r in cur.fetchall()]
+            if q_ids:
+                cur.execute("DELETE FROM question_options WHERE question_id = ANY(%s)", (q_ids,))
+                cur.execute("DELETE FROM question_matches WHERE question_id = ANY(%s)", (q_ids,))
+                cur.execute("DELETE FROM questions WHERE quiz_id = %s", (req.item_id,))
+            cur.execute("UPDATE daily_quiz_slots SET quiz_id = NULL WHERE quiz_id = %s", (req.item_id,))
+            cur.execute("SELECT id FROM student_quiz_attempts WHERE quiz_id = %s", (req.item_id,))
+            attempt_ids = [r["id"] for r in cur.fetchall()]
+            if attempt_ids:
+                cur.execute("DELETE FROM student_quiz_attempt_answers WHERE attempt_id = ANY(%s)", (attempt_ids,))
+                cur.execute("DELETE FROM student_quiz_attempts WHERE quiz_id = %s", (req.item_id,))
+            cur.execute("DELETE FROM quizzes WHERE id = %s", (req.item_id,))
+            action = "permanent_delete"
+            detail = f"Permanently deleted quiz '{target_title}'."
+        else:
+            cur.close()
+            conn.close()
+            raise HTTPException(status_code=400, detail="Invalid item_type.")
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        log_teacher_activity(
+            teacher_name=req.teacher_name or "Teacher",
+            action_type=action,
+            target_type=req.item_type,
+            target_id=req.item_id,
+            target_title=target_title,
+            topic_id=topic_id,
+            details=detail,
+            teacher_id=req.teacher_id
+        )
+        return {"success": True, "message": f"Permanently deleted '{target_title}'."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/teacher-history")
+def get_teacher_history():
+    try:
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT id, teacher_id, teacher_name, action_type, target_type, target_id, target_title, topic_id, details, created_at
+            FROM teacher_activity_logs
+            ORDER BY created_at DESC
+            LIMIT 100
+        """)
+        logs = cur.fetchall()
+        cur.close()
+        conn.close()
+        return {"success": True, "history": [dict(l) for l in logs]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 
